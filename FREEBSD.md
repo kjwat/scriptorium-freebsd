@@ -25,6 +25,12 @@ SimpleTerm, SimplePlay and SimplePDF. Existing release tests remain required.
 The native SID compatibility library is built by SimpleSuite's own bootstrap;
 no parent porting workspace is required by a standalone clone.
 
+Calibre remains a required ebook conversion dependency. The installer checks
+the official latest binary catalogue through a temporary repository directory,
+using latest only for that package while normal system updates retain quarterly.
+If the binary package is unavailable, the helper uses `deskutils/calibre` in the
+Ports Collection. It never substitutes a Linux binary or omits ebook conversion.
+
 SimpleCheck, SimpleTrident, aliases, reminders and normal writing configuration
 remain part of the installation. The checked-in defaults are sanitized release
 defaults; personal calendar data, browser history, cookies, keys, credentials

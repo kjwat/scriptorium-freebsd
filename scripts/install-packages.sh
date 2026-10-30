@@ -1119,10 +1119,11 @@ case "$family" in
         run_package_command freebsd as_root env LC_ALL=C pkg update
         run_package_command freebsd as_root env LC_ALL=C pkg install -y \
             bash gmake pkgconf ncurses glib curl openssl \
-            sudo git poppler-utils hs-pandoc calibre libreoffice djvulibre \
+            sudo git poppler-utils hs-pandoc libreoffice djvulibre \
             nano zip unzip gtar xdg-utils file less fzf pulseaudio bsdisks gvfs e2fsprogs exfat-utils fusefs-exfat fusefs-ntfs wl-clipboard xclip xsel-conrad \
             python3 py312-pygobject webkit2-gtk_41 \
             isync msmtp calcurse links ca_root_nss rsync $desktop_packages $simpleserve_packages
+        run_package_command freebsd as_root python3 "$ROOT/scripts/install-calibre-freebsd.py"
         ;;
     macos)
         run_package_command macos env LC_ALL=C brew install \

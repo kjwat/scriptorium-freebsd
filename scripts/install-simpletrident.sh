@@ -81,6 +81,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 common_flags="-std=c11 -O2 -Wall -Wextra"
+if [ "$(uname -s)" = FreeBSD ]; then
+    common_flags="$common_flags -L/usr/local/lib -Wl,-rpath,/usr/local/lib"
+fi
 
 if command -v pkg-config >/dev/null 2>&1 &&
    pkg-config --exists ncursesw; then
