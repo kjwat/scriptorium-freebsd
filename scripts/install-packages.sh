@@ -1,0 +1,1155 @@
+#!/bin/sh
+set -eu
+
+ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+family="$("$ROOT/scripts/detect-platform.sh")"
+package_scope=${SCRIPTORIUM_PACKAGES_SCOPE:-all}
+package_log=
+package_status_file=
+noninteractive=${SCRIPTORIUM_NONINTERACTIVE:-0}
+pacman_confirmation=
+
+case "$noninteractive" in
+    0) ;;
+    1) pacman_confirmation=--noconfirm ;;
+    *)
+        echo "SCRIPTORIUM_NONINTERACTIVE must be 0 or 1." >&2
+        exit 2
+        ;;
+esac
+
+case "$package_scope" in
+    all | network) ;;
+    *)
+        echo "SCRIPTORIUM_PACKAGES_SCOPE must be all or network." >&2
+        exit 2
+        ;;
+esac
+
+. "$ROOT/scripts/resolve-simpleserve-role.sh"
+network_role=$(scriptorium_resolve_simpleserve_role) || exit $?
+if [ "$network_role" = none ]; then
+    install_simpleserve=0
+else
+    install_simpleserve=1
+fi
+
+platform_id() {
+    if [ "$(uname -s 2>/dev/null || echo unknown)" = Darwin ]; then
+        printf '%s\n' macos
+        return
+    fi
+    if [ "$(uname -s 2>/dev/null || echo unknown)" = FreeBSD ]; then
+        printf '%s\n' freebsd
+        return
+    fi
+
+    [ -r /etc/os-release ] || {
+        printf '%s\n' unknown
+        return
+    }
+
+    awk -F= '
+        $1 == "ID" {
+            value = substr($0, index($0, "=") + 1)
+            gsub(/^[\047"]|[\047"]$/, "", value)
+            if (value ~ /^[A-Za-z0-9._-]+$/)
+                print tolower(value)
+            else
+                print "unknown"
+            found=1
+            exit
+        }
+        END { if (!found) print "unknown" }
+    ' /etc/os-release
+}
+
+distro_id="$(platform_id)"
+
+cleanup_package_files() {
+    [ -z "$package_log" ] || rm -f -- "$package_log"
+    [ -z "$package_status_file" ] || rm -f -- "$package_status_file"
+}
+
+trap cleanup_package_files EXIT
+
+case "$install_simpleserve" in
+    0 | 1) ;;
+    *)
+        echo "SIMPLESUITE_INSTALL_SIMPLESERVE must be 0 or 1." >&2
+        exit 2
+        ;;
+esac
+export SIMPLESUITE_INSTALL_SIMPLESERVE="$install_simpleserve"
+export SIMPLESUITE_NETWORK_ROLE="$network_role"
+
+have_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+have_calibre() {
+    if have_cmd ebook-convert && have_cmd calibre-debug; then return 0; fi
+    for calibre_dir in /opt/calibre /Applications/calibre.app/Contents/MacOS; do
+        if [ -x "$calibre_dir/ebook-convert" ] && [ -x "$calibre_dir/calibre-debug" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+have_libreoffice() {
+    have_cmd soffice || have_cmd libreoffice ||
+        [ -x /Applications/LibreOffice.app/Contents/MacOS/soffice ]
+}
+
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif have_cmd sudo; then
+        if [ "$noninteractive" -eq 1 ]; then
+            sudo -n "$@"
+        else
+            sudo "$@"
+        fi
+    else
+        printf 'Root privileges are required, but sudo is not installed.\n' >&2
+        printf 'Run the installer as root or install/configure sudo first.\n' >&2
+        return 127
+    fi
+}
+
+have_pkgconfig() {
+    pkg-config --exists "$1" >/dev/null 2>&1
+}
+
+have_any_editor() {
+    have_cmd nano || have_cmd vim || have_cmd nvim || have_cmd emacs || have_cmd micro
+}
+
+have_gnu_make() {
+    (have_cmd make && make --version 2>/dev/null | grep -q 'GNU Make') ||
+        (have_cmd gmake && gmake --version 2>/dev/null | grep -q 'GNU Make')
+}
+
+have_reminder_scheduler() {
+    if [ "$family" = macos ]; then
+        have_cmd launchctl
+        return
+    fi
+    have_cmd crontab ||
+        (have_cmd systemctl && systemctl --user show-environment >/dev/null 2>&1)
+}
+
+network_dependencies_already_present() {
+    [ "$network_role" != none ] || return 0
+
+    have_cmd ssh || return 1
+    have_cmd sshd || return 1
+
+    case "$family" in
+        macos)
+            have_cmd dns-sd || return 1
+            have_cmd launchctl || return 1
+            have_cmd mount_nfs || return 1
+            if [ "$network_role" = server ]; then
+                have_cmd nfsd || return 1
+                have_cmd sharing || return 1
+            fi
+            ;;
+        freebsd)
+            have_pkgconfig avahi-client || return 1
+            have_cmd avahi-daemon || return 1
+            have_cmd avahi-browse || return 1
+            have_cmd mount_nfs || return 1
+            if [ "$network_role" = server ]; then
+                have_cmd blkid || return 1
+                have_cmd avahi-publish-service || return 1
+                have_cmd nfsd || return 1
+            fi
+            ;;
+        *)
+            have_pkgconfig avahi-client || return 1
+            have_cmd avahi-daemon || return 1
+            have_cmd avahi-browse || return 1
+            have_cmd mount.nfs || return 1
+            have_cmd mount.cifs || return 1
+            if [ "$network_role" = server ]; then
+                have_cmd blkid || return 1
+                have_cmd avahi-publish-service || return 1
+                have_cmd exportfs || return 1
+                have_cmd smbd || return 1
+                have_cmd testparm || return 1
+            fi
+            ;;
+    esac
+    return 0
+}
+
+version_at_least_14_2() (
+    IFS=.
+    set -- $1
+    major=${1:-0}
+    minor=${2:-0}
+    case "$major:$minor" in
+        *[!0-9:]*) return 1 ;;
+    esac
+    [ "$major" -gt 14 ] ||
+        { [ "$major" -eq 14 ] && [ "$minor" -ge 2 ]; }
+)
+
+prepare_homebrew_path() {
+    [ "$family" = macos ] || return 0
+    have_cmd brew && return 0
+
+    for brew_candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+        [ -x "$brew_candidate" ] || continue
+        PATH="${brew_candidate%/*}:$PATH"
+        export PATH
+        return 0
+    done
+}
+
+validate_macos_host() {
+    [ "$family" = macos ] || return 0
+
+    macos_version=$(sw_vers -productVersion 2>/dev/null || true)
+    if ! version_at_least_14_2 "$macos_version"; then
+        echo "SimpleSuite requires macOS 14.2 or newer (found ${macos_version:-unknown})." >&2
+        exit 1
+    fi
+
+    if ! have_cmd xcode-select || ! xcode-select -p >/dev/null 2>&1 ||
+       ! have_cmd xcrun || ! xcrun --find clang >/dev/null 2>&1; then
+        echo "Apple Command Line Tools are required. Run: xcode-select --install" >&2
+        exit 1
+    fi
+
+    sdk_version=$(xcrun --sdk macosx --show-sdk-version 2>/dev/null || true)
+    if ! version_at_least_14_2 "$sdk_version"; then
+        echo "The selected Xcode SDK must be 14.2 or newer (found ${sdk_version:-unknown})." >&2
+        exit 1
+    fi
+}
+
+configure_homebrew_pkgconfig() {
+    [ "$family" = macos ] || return 0
+    have_cmd brew || return 0
+
+    for formula in ncurses glib curl openssl@3 gtk+3 vte3 pcre2 fontconfig cairo ffmpeg sdl2 libass fluid-synth libsidplayfp json-glib; do
+        formula_prefix=$(brew --prefix "$formula" 2>/dev/null) || continue
+        for pkgconfig_dir in "$formula_prefix/lib/pkgconfig" \
+                             "$formula_prefix/share/pkgconfig"; do
+            [ -d "$pkgconfig_dir" ] || continue
+            case ":${PKG_CONFIG_PATH:-}:" in
+                *":$pkgconfig_dir:"*) ;;
+                *) PKG_CONFIG_PATH="$pkgconfig_dir${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" ;;
+            esac
+        done
+    done
+    export PKG_CONFIG_PATH
+}
+
+have_simplebrowse_js() {
+    have_cmd python3 || return 1
+
+    python3 - <<'PY' >/dev/null 2>&1
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("WebKit2", "4.1")
+from gi.repository import Gtk, WebKit2
+PY
+}
+
+dependencies_already_present() {
+    for dependency_command in \
+        cc pkg-config git python3 pdftotext pdfinfo pdftohtml pdftoppm pandoc \
+        c44 djvm djvused djvutxt ddjvu \
+        zip unzip tar file less fzf links \
+        mbsync msmtp calcurse curl rsync; do
+        have_cmd "$dependency_command" || return 1
+    done
+    have_calibre || return 1
+    have_libreoffice || return 1
+
+    case "$family" in
+        macos | freebsd)
+            have_gnu_make || return 1
+            ;;
+        *)
+            have_cmd make || return 1
+            ;;
+    esac
+
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        Linux)
+            have_cmd sudo || return 1
+            have_cmd lsblk || return 1
+            ;;
+        FreeBSD) have_cmd sudo || return 1 ;;
+    esac
+
+    have_any_editor || return 1
+    have_pkgconfig ncursesw || return 1
+    have_pkgconfig libcurl || return 1
+    have_pkgconfig openssl || return 1
+    have_pkgconfig gio-2.0 || return 1
+    have_cmd glib-compile-resources || return 1
+    have_cmd fc-match || return 1
+    have_pkgconfig 'gtk+-3.0 >= 3.24' || return 1
+    have_pkgconfig 'vte-2.91 >= 0.60' || return 1
+    have_pkgconfig libpcre2-8 || return 1
+    case "$(uname -s 2>/dev/null || true)" in
+        Linux | FreeBSD)
+            have_pkgconfig evince-view-3.0 || return 1
+            have_pkgconfig evince-document-3.0 || return 1
+            ;;
+    esac
+    case "$(uname -s 2>/dev/null || true)" in
+        Linux | FreeBSD | Darwin)
+            have_cmd c++ || return 1
+            if [ "$family" != macos ]; then have_cmd update-desktop-database || return 1; fi
+            for media_library in 'glib-2.0 >= 2.66' 'libavcodec >= 59' \
+                'libavformat >= 59' libavutil libavfilter libswscale libswresample \
+                sdl2 cairo libass fluidsynth libsidplayfp json-glib-1.0; do
+                have_pkgconfig "$media_library" || return 1
+            done
+            ;;
+    esac
+    if [ "$(uname -s 2>/dev/null || echo unknown)" = Linux ] &&
+       [ "${SIMPLENET_WITH_NM:-1}" != 0 ]; then
+        have_pkgconfig 'libnm >= 1.24' || return 1
+    fi
+    have_reminder_scheduler || return 1
+
+    case "$family" in
+        macos | msys2) ;;
+        freebsd)
+            have_cmd python3 || return 1
+            have_simplebrowse_js || return 1
+            ;;
+        *)
+            have_cmd python3 || return 1
+            have_simplebrowse_js || return 1
+            ;;
+    esac
+
+    case "$family" in
+        macos)
+            have_cmd open || return 1
+            ;;
+        msys2)
+            ;;
+        freebsd)
+            have_cmd xdg-open || return 1
+            have_cmd gio || return 1
+            have_cmd umount || return 1
+            have_cmd bsdisks || return 1
+            pkg info -e gvfs >/dev/null 2>&1 || return 1
+            have_cmd e2fsck || return 1
+            have_cmd exfatfsck || return 1
+            have_cmd mount.exfat || return 1
+            have_cmd ntfsfix || return 1
+            have_cmd ifconfig || return 1
+            have_cmd route || return 1
+            have_cmd wpa_cli || return 1
+            (have_cmd xclip || have_cmd xsel) || return 1
+            have_cmd pactl || return 1
+            have_cmd parec || return 1
+            ;;
+        *)
+            for dependency_command in \
+                xdg-open gio findmnt udisksctl e2fsck fsck.fat fsck.exfat \
+                ntfsfix wl-copy wl-paste pactl parec; do
+                have_cmd "$dependency_command" || return 1
+            done
+            (have_cmd xclip || have_cmd xsel) || return 1
+            ;;
+    esac
+
+    network_dependencies_already_present || return 1
+
+    if [ "$(uname -s 2>/dev/null || echo unknown)" = Linux ]; then
+        "$ROOT/scripts/checkdeps.sh" --simplevol >/dev/null 2>&1 || return 1
+    fi
+
+    return 0
+}
+
+repository_help() {
+    repo_family=$1
+    repo_detail=${2-}
+
+    printf '\n!! Package repository configuration problem detected.\n' >&2
+    [ -z "$repo_detail" ] || printf '   %s\n' "$repo_detail" >&2
+
+    case "$repo_family" in
+        debian)
+            printf '%s\n' \
+                '   APT has no usable package sources.' \
+                '   Review /etc/apt/sources.list and the .list/.sources files in' \
+                '   /etc/apt/sources.list.d/.' \
+                '   Ubuntu: open "Software & Updates" and enable the official Main repository.' \
+                '   Debian: restore the official sources for the installed release.' \
+                '   Then run: sudo apt update' >&2
+            ;;
+        arch)
+            printf '%s\n' \
+                '   One or more enabled pacman repositories have no active Server entry.' \
+                '   EndeavourOS live session: open Welcome and run an' \
+                '   "Update Mirrors (Arch, ...)" action (reflector-simple or rate-mirrors).' \
+                '   Save the generated list; this repairs /etc/pacman.d/mirrorlist.' \
+                '   If /etc/pacman.d/endeavouros-mirrorlist is also missing or empty, run:' \
+                '     sudo touch /etc/pacman.d/endeavouros-mirrorlist' \
+                '     eos-rankmirrors' \
+                '   Then run: sudo pacman -Syu' >&2
+            ;;
+        fedora)
+            printf '%s\n' \
+                '   DNF has no enabled software repositories.' \
+                '   List the configured repositories with: sudo dnf repolist --all' \
+                '   Enable the official base and updates repositories in Software Repositories' \
+                '   or with dnf config-manager, then run: sudo dnf makecache' >&2
+            ;;
+        alpine)
+            printf '%s\n' \
+                '   APK has no active repository entries in /etc/apk/repositories.' \
+                '   Select an official mirror with: sudo setup-apkrepos' \
+                '   Then run: sudo apk update' >&2
+            ;;
+        void)
+            printf '%s\n' \
+                '   XBPS has no usable package repository.' \
+                '   Check the repository= entries in /etc/xbps.d and /usr/share/xbps.d.' \
+                "   Select an official mirror with xmirror, or restore Void's main repository" \
+                '   configuration for this architecture, then run: sudo xbps-install -S' >&2
+            ;;
+        suse)
+            printf '%s\n' \
+                '   Zypper has no enabled software repositories.' \
+                '   List them with: sudo zypper repos --uri' \
+                '   Enable the official repositories with YaST Software Repositories or:' \
+                '     sudo zypper modifyrepo --enable <repository-alias>' \
+                '   Then run: sudo zypper refresh' >&2
+            ;;
+        macos)
+            printf '%s\n' \
+                '   Homebrew cannot access its configured package source.' \
+                '   Inspect the configuration with: brew config' \
+                '   Repair Homebrew according to the reported remote/tap error, then run:' \
+                '     brew update' >&2
+            ;;
+        freebsd)
+            printf '%s\n' \
+                '   Check that the FreeBSD package repository is enabled with: pkg -vv' \
+                '   Then refresh its catalogue with: sudo pkg update -f' >&2
+            ;;
+    esac
+
+    printf '\n   After repairing the repositories, run ./install.sh again.\n' >&2
+}
+
+arch_partial_upgrade_help() {
+    printf '%s\n' \
+        '' \
+        '!! Arch/Cachy package installation did not complete.' \
+        '' \
+        '   Scriptorium uses a full pacman -Syu transaction because Arch-based' \
+        '   systems do not support partial upgrades. Resolve the conflict or' \
+        '   stale mirror reported above, then complete the upgrade manually:' \
+        '' \
+        '     sudo pacman -Syu' \
+        '' \
+        '   After that completes, run ./install.sh again.' \
+        '' >&2
+}
+
+package_unavailable_help() {
+    unavailable_family=$1
+
+    printf '%s\n' \
+        '' \
+        '!! A package required for the complete Scriptorium feature set is not available.' \
+        '' >&2
+
+    case "$unavailable_family" in
+        debian)
+            printf '%s\n' \
+                '   On Ubuntu, make sure the Universe component is enabled.' \
+                '   On Debian/Ubuntu releases that do not package WebKitGTK 4.1,' \
+                '   upgrade to a current supported release before installing.' >&2
+            ;;
+        alpine)
+            printf '%s\n' \
+                '   Make sure both the main and community repositories for this' \
+                '   Alpine release are enabled in /etc/apk/repositories.' >&2
+            ;;
+        arch)
+            printf '%s\n' \
+                '   Refresh mirrors and use repositories matching the installed' \
+                '   Arch-derived distribution; do not mix release snapshots.' >&2
+            ;;
+        fedora | suse | void | freebsd)
+            printf '%s\n' \
+                '   Make sure the official repositories for a currently supported' \
+                '   release are enabled and match the installed system.' >&2
+            ;;
+        macos)
+            printf '%s\n' \
+                '   Run brew update and check that this macOS release is supported' \
+                '   by the current Homebrew formulae.' >&2
+            ;;
+    esac
+
+    printf '%s\n' \
+        '' \
+        '   Review the exact missing package in the package-manager output above,' \
+        '   repair the repository/release configuration, then rerun ./install.sh.' \
+        '' >&2
+}
+
+explain_repository_failure() {
+    error_family=$1
+    error_log=$2
+
+    case "$error_family" in
+        debian)
+            if grep -Eqi \
+                'unable to locate package|package .* has no installation candidate' \
+                "$error_log"; then
+                package_unavailable_help debian
+                return 0
+            fi
+            if grep -Eqi \
+                'list of sources could not be read|malformed entry .* (sources\.list|list file)|no active sources found' \
+                "$error_log"; then
+                repository_help debian
+                return 0
+            fi
+            ;;
+        arch)
+            if grep -Eqi 'target not found:' "$error_log"; then
+                package_unavailable_help arch
+                return 0
+            fi
+            if grep -Eqi \
+                'no servers configured for repository|no servers are configured for the repository' \
+                "$error_log"; then
+                repository_help arch
+                return 0
+            fi
+            ;;
+        fedora)
+            if grep -Eqi 'no match for argument:|unable to find a match:' "$error_log"; then
+                package_unavailable_help fedora
+                return 0
+            fi
+            if grep -Eqi \
+                'there are no enabled repositories|no enabled repositories|no repositories available' \
+                "$error_log"; then
+                repository_help fedora
+                return 0
+            fi
+            ;;
+        alpine)
+            if grep -Eqi 'unable to select packages:|no such package' "$error_log"; then
+                package_unavailable_help alpine
+                return 0
+            fi
+            if grep -Eqi \
+                'repositories file unavailable|no active repository entries' \
+                "$error_log"; then
+                repository_help alpine
+                return 0
+            fi
+            ;;
+        void)
+            if grep -Eqi 'package .* not found|failed to find .* in repository' "$error_log"; then
+                package_unavailable_help void
+                return 0
+            fi
+            if grep -Eqi \
+                'xbps-bin: no repositories|no repositories available|no usable package repository' \
+                "$error_log"; then
+                repository_help void
+                return 0
+            fi
+            ;;
+        suse)
+            if grep -Eqi 'not found in package names|no provider of .* found' "$error_log"; then
+                package_unavailable_help suse
+                return 0
+            fi
+            if grep -Eqi \
+                'there are no enabled repositories defined|no repositories defined|no enabled repositories' \
+                "$error_log"; then
+                repository_help suse
+                return 0
+            fi
+            ;;
+        macos)
+            if grep -Eqi 'no available formula|no formulae or casks found' "$error_log"; then
+                package_unavailable_help macos
+                return 0
+            fi
+            if grep -Eqi \
+                'invalid value for HOMEBREW_.*_GIT_REMOTE|not a git repository.*Homebrew|no remote.*origin' \
+                "$error_log"; then
+                repository_help macos
+                return 0
+            fi
+            ;;
+        freebsd)
+            if grep -Eqi 'no packages available to install matching|was not found in the repositories' "$error_log"; then
+                package_unavailable_help freebsd
+                return 0
+            fi
+            if grep -Eqi 'no packages available|unable to update repository|no repositories configured' "$error_log"; then
+                repository_help freebsd
+                return 0
+            fi
+            ;;
+    esac
+
+    return 1
+}
+
+run_package_command() {
+    command_family=$1
+    shift
+
+    attempt=1
+    while :; do
+        cleanup_package_files
+        package_log=$(mktemp "${TMPDIR:-/tmp}/scriptorium-packages.XXXXXX")
+        package_status_file=$package_log.status
+        : > "$package_status_file"
+
+        # POSIX sh has no pipefail. Record the package manager's status separately
+        # while tee keeps its output visible and available for diagnosis.
+        (
+            set +e
+            "$@"
+            command_status=$?
+            printf '%s\n' "$command_status" > "$package_status_file"
+            exit 0
+        ) 2>&1 | tee "$package_log"
+
+        command_status=
+        IFS= read -r command_status < "$package_status_file" || command_status=1
+
+        case "$command_status" in
+            0)
+                cleanup_package_files
+                package_log=
+                package_status_file=
+                return 0
+                ;;
+            '' | *[!0-9]*)
+                command_status=1
+                ;;
+        esac
+
+        if [ "$attempt" -eq 1 ]; then
+            printf '\n!! Package installation failed. This may be a temporary network or mirror hiccup.\n' >&2
+            printf '!! Retrying once in 5 seconds...\n' >&2
+            cleanup_package_files
+            package_log=
+            package_status_file=
+            sleep 5
+            attempt=2
+            continue
+        fi
+
+        if ! explain_repository_failure "$command_family" "$package_log"; then
+            if [ "$command_family" = arch ]; then
+                arch_partial_upgrade_help
+            else
+                printf '\n!! Package installation failed; review the package-manager error above.\n' >&2
+            fi
+        fi
+
+        cleanup_package_files
+        package_log=
+        package_status_file=
+        return "$command_status"
+    done
+}
+
+debian_sources_configured() {
+    for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        [ -r "$source_file" ] || continue
+        if awk '
+            /^[[:space:]]*deb([[:space:]]+\[[^]]*\])?[[:space:]]+[^#[:space:]]+/ &&
+            $0 !~ /^[[:space:]]*deb([[:space:]]+\[[^]]*\])?[[:space:]]+cdrom:/ {
+                found=1
+            }
+            END { exit found ? 0 : 1 }
+        ' "$source_file"; then
+            return 0
+        fi
+    done
+
+    for source_file in /etc/apt/sources.list.d/*.sources; do
+        [ -r "$source_file" ] || continue
+        if awk '
+            BEGIN { RS=""; found=0 }
+            {
+                has_deb = $0 ~ /(^|\n)[[:space:]]*Types:[^\n]*(^|[[:space:]])deb([[:space:]]|$)/
+                has_uri = $0 ~ /(^|\n)[[:space:]]*URIs:[[:space:]]*[^[:space:]#]/
+                cdrom_only = $0 ~ /(^|\n)[[:space:]]*URIs:[[:space:]]*cdrom:/
+                disabled = $0 ~ /(^|\n)[[:space:]]*Enabled:[[:space:]]*no([[:space:]]|$)/
+                if (has_deb && has_uri && !cdrom_only && !disabled)
+                    found=1
+            }
+            END { exit found ? 0 : 1 }
+        ' "$source_file"; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+check_repository_configuration() {
+    check_family=$1
+
+    case "$check_family" in
+        debian)
+            # apt-get expands this identifier; the shell must not.
+            # shellcheck disable=SC2016
+            if ! apt-get indextargets --no-release-info --format '$(IDENTIFIER)' \
+                2>/dev/null | grep -q . && ! debian_sources_configured; then
+                repository_help debian
+                return 1
+            fi
+            ;;
+        arch)
+            if command -v pacman-conf >/dev/null 2>&1; then
+                configured_repos=$(pacman-conf --repo-list 2>/dev/null) || return 0
+                missing_repos=
+
+                if [ -z "$configured_repos" ]; then
+                    repository_help arch 'No pacman repositories are enabled.'
+                    return 1
+                fi
+
+                while IFS= read -r repo_name; do
+                    [ -n "$repo_name" ] || continue
+                    repo_servers=$(pacman-conf --repo "$repo_name" Server 2>/dev/null) ||
+                        repo_servers=
+                    if [ -z "$repo_servers" ]; then
+                        if [ -z "$missing_repos" ]; then
+                            missing_repos=$repo_name
+                        else
+                            missing_repos="$missing_repos, $repo_name"
+                        fi
+                    fi
+                done <<EOF
+$configured_repos
+EOF
+
+                if [ -n "$missing_repos" ]; then
+                    repository_help arch "Repositories without servers: $missing_repos"
+                    return 1
+                fi
+            fi
+            ;;
+        alpine)
+            if [ ! -r /etc/apk/repositories ] ||
+                ! grep -Eq '^[[:space:]]*[^#[:space:]]' /etc/apk/repositories; then
+                repository_help alpine
+                return 1
+            fi
+            ;;
+        void)
+            active_xbps_repo=0
+            for repo_file in /etc/xbps.d/*.conf /usr/share/xbps.d/*.conf; do
+                [ -f "$repo_file" ] || continue
+                if grep -Eq '^[[:space:]]*repository[[:space:]]*=' "$repo_file"; then
+                    active_xbps_repo=1
+                    break
+                fi
+            done
+            if [ "$active_xbps_repo" -eq 0 ]; then
+                repository_help void
+                return 1
+            fi
+            ;;
+    esac
+
+    return 0
+}
+
+if [ "$family" = unknown ]; then
+    family_file=$HOME/.config/simplesuite/family
+
+    if [ -f "$family_file" ]; then
+        saved_family=
+        IFS= read -r saved_family < "$family_file" || true
+
+        case "$saved_family" in
+            debian | arch | fedora | alpine | void | suse | freebsd)
+                family=$saved_family
+                ;;
+            *)
+                printf 'Invalid saved package family in %s\n' "$family_file" >&2
+                exit 1
+                ;;
+        esac
+    else
+        printf '\nUnknown system detected.\n\n'
+        while :; do
+            printf '%s\n' \
+                'Select package family:' \
+                '1) debian (apt)' \
+                '2) arch (pacman)' \
+                '3) fedora (dnf)' \
+                '4) alpine (apk)' \
+                '5) void (xbps)' \
+                '6) suse (zypper)' \
+                '7) freebsd (pkg)'
+            printf '\nEnter choice: '
+
+            if ! IFS= read -r choice; then
+                printf '\nUnable to read package family selection.\n' >&2
+                exit 1
+            fi
+
+            case "$choice" in
+                1) family=debian ;;
+                2) family=arch ;;
+                3) family=fedora ;;
+                4) family=alpine ;;
+                5) family=void ;;
+                6) family=suse ;;
+                7) family=freebsd ;;
+                *)
+                    printf '\nInvalid choice. Enter a number from 1 to 7.\n\n' >&2
+                    continue
+                    ;;
+            esac
+            break
+        done
+
+        mkdir -p "$HOME/.config/simplesuite"
+        printf '%s\n' "$family" > "$family_file"
+        chmod 600 "$family_file"
+    fi
+fi
+
+prepare_homebrew_path
+validate_macos_host
+configure_homebrew_pkgconfig
+
+if [ "$package_scope" = network ]; then
+    if [ "$network_role" = none ]; then
+        printf 'Trident networking is disabled; no network packages requested.\n'
+        exit 0
+    fi
+    if network_dependencies_already_present; then
+        printf 'Trident %s dependencies already present; skipping package manager install.\n' \
+            "$network_role"
+        exit 0
+    fi
+elif dependencies_already_present; then
+    printf 'Package dependencies already present; skipping package manager install.\n'
+    exit 0
+fi
+
+case "$distro_id" in
+    rhel | centos | rocky | almalinux | ol | amzn)
+        printf '%s\n' \
+            'This RHEL-family release does not provide the complete Scriptorium' \
+            'dependency set in its default official repositories.' \
+            'Fedora is the supported DNF target. On this system, provision the' \
+            'dependencies reported by scripts/checkdeps.sh (for example through' \
+            'approved EPEL or vendor repositories), then rerun ./install.sh.' >&2
+        exit 2
+        ;;
+    opensuse-leap | sles)
+        printf '%s\n' \
+            'This SUSE release does not provide the complete Scriptorium dependency' \
+            'set in its default official repositories.' \
+            'openSUSE Tumbleweed is the supported Zypper target. Provision every' \
+            'dependency reported by scripts/checkdeps.sh, then rerun ./install.sh.' >&2
+        exit 2
+        ;;
+esac
+
+case "$family" in
+    debian) package_manager=apt-get ;;
+    arch) package_manager=pacman ;;
+    fedora) package_manager=dnf ;;
+    alpine) package_manager=apk ;;
+    void) package_manager=xbps-install ;;
+    suse) package_manager=zypper ;;
+    macos) package_manager=brew ;;
+    freebsd) package_manager=pkg ;;
+    *) package_manager= ;;
+esac
+
+if [ -n "$package_manager" ] && ! have_cmd "$package_manager"; then
+    printf 'Detected package family %s, but %s is not available on PATH.\n' \
+        "$family" "$package_manager" >&2
+    exit 1
+fi
+
+if [ "$family" != macos ] && [ "$(id -u)" -ne 0 ] && ! have_cmd sudo; then
+    printf 'Package installation needs root privileges, but sudo is unavailable.\n' >&2
+    printf 'Run ./install.sh as root or install/configure sudo first.\n' >&2
+    exit 1
+fi
+
+simpleserve_packages=
+if [ "$install_simpleserve" -eq 1 ]; then
+    case "$family" in
+        debian) simpleserve_packages="libavahi-client-dev nfs-common avahi-daemon avahi-utils cifs-utils openssh-client openssh-server" ;;
+        void) simpleserve_packages="avahi-libs-devel nfs-utils avahi avahi-utils cifs-utils openssh" ;;
+        arch) simpleserve_packages="nfs-utils avahi cifs-utils openssh" ;;
+        alpine) simpleserve_packages="avahi-dev nfs-utils avahi avahi-openrc avahi-tools cifs-utils openssh" ;;
+        fedora) simpleserve_packages="avahi-devel nfs-utils avahi avahi-tools cifs-utils openssh-clients openssh-server" ;;
+        suse) simpleserve_packages="libavahi-devel nfs-client avahi avahi-utils cifs-utils openssh openssh-server" ;;
+        freebsd) simpleserve_packages="avahi-app" ;;
+    esac
+    if [ "$network_role" = server ]; then
+        case "$family" in
+            debian | suse) simpleserve_packages="$simpleserve_packages nfs-kernel-server samba" ;;
+            void | arch | fedora) simpleserve_packages="$simpleserve_packages samba" ;;
+            alpine) simpleserve_packages="$simpleserve_packages nfs-utils-openrc samba samba-server-openrc" ;;
+            freebsd) simpleserve_packages="$simpleserve_packages e2fsprogs samba420" ;;
+        esac
+    fi
+fi
+
+if [ "$package_scope" = network ]; then
+    case "$family" in
+        debian)
+            check_repository_configuration debian
+            run_package_command debian as_root env DEBIAN_FRONTEND=noninteractive LC_ALL=C apt-get update
+            # shellcheck disable=SC2086
+            run_package_command debian as_root env DEBIAN_FRONTEND=noninteractive LC_ALL=C apt-get install -y $simpleserve_packages
+            ;;
+        arch)
+            check_repository_configuration arch
+            # Arch supports only full-system upgrade transactions.
+            # shellcheck disable=SC2086
+            run_package_command arch as_root env LC_ALL=C pacman -Syu --needed \
+                $pacman_confirmation $simpleserve_packages
+            ;;
+        fedora)
+            # shellcheck disable=SC2086
+            run_package_command fedora as_root env LC_ALL=C dnf install -y $simpleserve_packages
+            ;;
+        alpine)
+            check_repository_configuration alpine
+            # shellcheck disable=SC2086
+            run_package_command alpine as_root env LC_ALL=C apk add $simpleserve_packages
+            ;;
+        void)
+            check_repository_configuration void
+            # shellcheck disable=SC2086
+            run_package_command void as_root env LC_ALL=C xbps-install -Sy $simpleserve_packages
+            ;;
+        suse)
+            # shellcheck disable=SC2086
+            run_package_command suse as_root env LC_ALL=C zypper install -y $simpleserve_packages
+            ;;
+        freebsd)
+            run_package_command freebsd as_root env LC_ALL=C pkg update
+            # shellcheck disable=SC2086
+            run_package_command freebsd as_root env LC_ALL=C pkg install -y $simpleserve_packages
+            ;;
+        macos)
+            # SimpleServe's client and server transports are operating-system tools.
+            ;;
+    esac
+    if ! network_dependencies_already_present; then
+        printf 'Trident %s package installation completed, but required commands are still missing.\n' \
+            "$network_role" >&2
+        "$ROOT/scripts/checkdeps.sh" || true
+        exit 1
+    fi
+    printf 'Trident %s package installation verified.\n' "$network_role"
+    exit 0
+fi
+
+simplenet_packages=
+if [ "$(uname -s 2>/dev/null || echo unknown)" = Linux ] &&
+   [ "${SIMPLENET_WITH_NM:-1}" != 0 ]; then
+    case "$family" in
+        debian) simplenet_packages=libnm-dev ;;
+        void | suse) simplenet_packages=NetworkManager-devel ;;
+        arch) simplenet_packages=libnm ;;
+        alpine) simplenet_packages=networkmanager-dev ;;
+        fedora) simplenet_packages=NetworkManager-libnm-devel ;;
+    esac
+fi
+
+# Shared player, PDF reader and terminal build/runtime dependencies.
+desktop_packages=
+case "$family" in
+    debian)
+        desktop_packages='libgtk-3-dev libevince-dev poppler-data libvte-2.91-dev libpcre2-dev fontconfig fonts-dejavu-core adwaita-icon-theme desktop-file-utils ffmpeg libcairo2-dev libavformat-dev libavcodec-dev libavutil-dev libavfilter-dev libswscale-dev libswresample-dev libsdl2-dev libass-dev libfluidsynth-dev libsidplayfp-dev libjson-glib-dev timgm6mb-soundfont'
+        ;;
+    arch)
+        desktop_packages='gtk3 evince vte3 pcre2 fontconfig ttf-dejavu adwaita-icon-theme desktop-file-utils ffmpeg cairo sdl2 libass fluidsynth libsidplayfp json-glib soundfont-fluid'
+        ;;
+    void)
+        desktop_packages='gtk+3-devel evince-devel vte3-devel pcre2-devel fontconfig dejavu-fonts-ttf adwaita-icon-theme desktop-file-utils ffmpeg6-devel cairo-devel SDL2-devel libass-devel fluidsynth-devel libsidplayfp-devel json-glib-devel soundfont-fluid'
+        ;;
+    alpine)
+        # Alpine does not package libsidplayfp; provision it before installing
+        # SimplePlay. Do not request a nonexistent package or enable testing.
+        desktop_packages='gtk+3.0-dev evince-dev vte3-dev pcre2-dev fontconfig font-dejavu adwaita-icon-theme desktop-file-utils ffmpeg-dev cairo-dev sdl2-dev libass-dev fluidsynth-dev json-glib-dev soundfont-timgm'
+        ;;
+    fedora)
+        desktop_packages='gcc-c++ gtk3-devel evince-devel vte291-devel pcre2-devel fontconfig dejavu-sans-mono-fonts adwaita-icon-theme desktop-file-utils ffmpeg-devel cairo-devel SDL2-devel libass-devel fluidsynth-devel libsidplayfp-devel json-glib-devel fluid-soundfont-gm'
+        ;;
+    suse)
+        desktop_packages='gcc-c++ gtk3-devel evince-devel vte-devel pcre2-devel fontconfig dejavu-fonts adwaita-icon-theme desktop-file-utils ffmpeg-devel cairo-devel libSDL2-devel libass-devel fluidsynth-devel libsidplayfp-devel json-glib-devel fluid-soundfont-gm'
+        ;;
+    freebsd)
+        desktop_packages='gtk3 evince vte3 pcre2 fontconfig dejavu adwaita-icon-theme desktop-file-utils ffmpeg sdl2 libass fluidsynth libsidplayfp json-glib fluid-soundfont'
+        ;;
+    macos)
+        desktop_packages='gtk+3 vte3 pcre2 fontconfig adwaita-icon-theme cairo ffmpeg sdl2 libass fluid-synth libsidplayfp json-glib'
+        ;;
+esac
+
+# Native SimpleVol effects and their redistributable LSP LV2 plugins.
+simplevol_packages=
+if [ "$(uname -s 2>/dev/null || echo unknown)" = Linux ]; then
+    case "$family" in
+        debian) simplevol_packages="pipewire-bin pipewire-pulse wireplumber lsp-plugins-lv2" ;;
+        arch) simplevol_packages="pipewire pipewire-audio pipewire-pulse wireplumber lsp-plugins-lv2" ;;
+        void) simplevol_packages="pipewire wireplumber lsp-plugins-lv2" ;;
+        alpine) simplevol_packages="pipewire pipewire-tools pipewire-pulse wireplumber lsp-plugins-lv2" ;;
+        fedora) simplevol_packages="pipewire pipewire-utils pipewire-pulseaudio wireplumber lsp-plugins-lv2" ;;
+        suse) simplevol_packages="pipewire pipewire-tools pipewire-pulseaudio wireplumber lsp-plugins" ;;
+    esac
+fi
+
+case "$family" in
+    debian)
+        check_repository_configuration debian
+
+        if command -v debconf-set-selections >/dev/null 2>&1; then
+            {
+                printf '%s\n' 'msmtp msmtp/apparmor boolean false'
+                printf '%s\n' 'msmtp msmtp/apparmor seen true'
+            } | as_root debconf-set-selections || true
+        fi
+
+        run_package_command debian as_root env DEBIAN_FRONTEND=noninteractive LC_ALL=C apt-get update
+        run_package_command debian as_root env DEBIAN_FRONTEND=noninteractive LC_ALL=C apt-get install -y \
+            build-essential pkg-config libncurses-dev libcurl4-openssl-dev libssl-dev libglib2.0-dev $simplenet_packages \
+            sudo git poppler-utils pandoc calibre libreoffice-writer libreoffice-calc djvulibre-bin \
+            nano zip unzip tar xdg-utils file less fzf pulseaudio-utils libglib2.0-bin util-linux udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g wl-clipboard xclip xsel \
+            python3 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1 \
+            isync msmtp calcurse links curl ca-certificates rsync cron $desktop_packages $simplevol_packages \
+            $simpleserve_packages
+        ;;
+    void)
+        check_repository_configuration void
+        run_package_command void as_root env LC_ALL=C xbps-install -Sy \
+            base-devel pkg-config ncurses-devel glib-devel libcurl-devel openssl-devel $simplenet_packages \
+            sudo git poppler-utils pandoc calibre libreoffice-writer libreoffice-calc djvulibre \
+            nano zip unzip tar xdg-utils file less fzf pulseaudio-utils glib util-linux udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g wl-clipboard xclip xsel \
+            python3 python3-gobject libwebkit2gtk41 \
+            isync msmtp calcurse links curl ca-certificates rsync cronie $desktop_packages $simplevol_packages \
+            $simpleserve_packages
+        ;;
+    arch)
+        check_repository_configuration arch
+        arch_keyrings=archlinux-keyring
+        for keyring in cachyos-keyring endeavouros-keyring manjaro-keyring; do
+            if pacman -Qq "$keyring" >/dev/null 2>&1 ||
+               pacman -Si "$keyring" >/dev/null 2>&1; then
+                arch_keyrings="$arch_keyrings $keyring"
+            fi
+        done
+        # Refresh keyrings first so a stale live image can authenticate the
+        # immediately following full-system transaction.
+        # shellcheck disable=SC2086
+        run_package_command arch as_root env LC_ALL=C pacman -Sy --needed \
+            $pacman_confirmation $arch_keyrings
+        arch_jack_provider=pipewire-jack
+        if pacman -Qq pipewire-jack >/dev/null 2>&1 || pacman -Qq jack2 >/dev/null 2>&1; then
+            arch_jack_provider=
+        fi
+        # shellcheck disable=SC2086
+        run_package_command arch as_root env LC_ALL=C pacman -Syu --needed \
+            $pacman_confirmation \
+            base-devel pkgconf ncurses curl openssl $simplenet_packages \
+            sudo git poppler pandoc-cli calibre libreoffice-fresh djvulibre \
+            nano zip unzip tar xdg-utils file less fzf libpulse $arch_jack_provider glib2 util-linux udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g ntfsprogs wl-clipboard xclip xsel \
+            python python-gobject webkit2gtk-4.1 \
+            isync msmtp calcurse links ca-certificates rsync cronie $desktop_packages $simplevol_packages \
+            $simpleserve_packages
+        ;;
+    alpine)
+        check_repository_configuration alpine
+        run_package_command alpine as_root env LC_ALL=C apk add \
+            build-base bash pkgconf ncurses-dev curl-dev openssl-dev $simplenet_packages \
+            sudo git poppler-utils pandoc calibre libreoffice-writer libreoffice-calc djvulibre \
+            nano zip unzip tar xdg-utils file less fzf pulseaudio-utils glib glib-dev util-linux udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g ntfs-3g-progs wl-clipboard xclip xsel \
+            python3 py3-gobject3 webkit2gtk-4.1 \
+            isync msmtp calcurse links curl ca-certificates rsync dcron $desktop_packages $simplevol_packages \
+            $simpleserve_packages
+        ;;
+    fedora)
+        run_package_command fedora as_root env LC_ALL=C dnf install -y \
+            gcc make pkgconf-pkg-config ncurses-devel libcurl-devel openssl-devel $simplenet_packages \
+            sudo git poppler-utils pandoc calibre libreoffice-writer libreoffice-calc djvulibre \
+            nano zip unzip tar xdg-utils file less fzf pulseaudio-utils glib2-devel util-linux udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g ntfsprogs wl-clipboard xclip xsel \
+            python3 python3-gobject webkit2gtk4.1 \
+            isync msmtp calcurse links curl ca-certificates rsync cronie $desktop_packages $simplevol_packages \
+            $simpleserve_packages
+        ;;
+    suse)
+        run_package_command suse as_root env LC_ALL=C zypper install -y \
+            gcc make pkg-config ncurses-devel libcurl-devel libopenssl-devel $simplenet_packages \
+            sudo git poppler-tools pandoc calibre libreoffice-writer libreoffice-calc djvulibre \
+            nano zip unzip tar xdg-utils file less fzf pulseaudio-utils glib2-tools glib2-devel util-linux udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g ntfsprogs wl-clipboard xclip xsel \
+            python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1 \
+            isync msmtp calcurse links curl ca-certificates rsync cron $desktop_packages $simplevol_packages \
+            $simpleserve_packages
+        ;;
+    freebsd)
+        run_package_command freebsd as_root env LC_ALL=C pkg update
+        run_package_command freebsd as_root env LC_ALL=C pkg install -y \
+            bash gmake pkgconf ncurses glib curl openssl \
+            sudo git poppler-utils hs-pandoc calibre libreoffice djvulibre \
+            nano zip unzip gtar xdg-utils file less fzf pulseaudio bsdisks gvfs e2fsprogs exfat-utils fusefs-exfat fusefs-ntfs wl-clipboard xclip xsel-conrad \
+            python3 py312-pygobject webkit2-gtk_41 \
+            isync msmtp calcurse links ca_root_nss rsync $desktop_packages $simpleserve_packages
+        ;;
+    macos)
+        run_package_command macos env LC_ALL=C brew install \
+            pkgconf ncurses curl make openssl@3 glib \
+            git poppler pandoc python djvulibre \
+            nano zip unzip libmagic less fzf \
+            isync msmtp calcurse links rsync $desktop_packages
+        if ! have_calibre; then
+            run_package_command macos env LC_ALL=C brew install --cask calibre
+        fi
+        if ! have_libreoffice; then
+            run_package_command macos env LC_ALL=C brew install --cask libreoffice
+        fi
+        ;;
+    *)
+        echo "Unknown platform family: $family" >&2
+        echo "Install packages manually, then re-run ./install.sh" >&2
+        exit 1
+        ;;
+esac
+
+configure_homebrew_pkgconfig
+if ! dependencies_already_present; then
+    printf '\nPackage installation completed, but one or more expected dependencies are still unavailable.\n' >&2
+    printf 'Dependency details follow; fix the reported package or PATH issue, then rerun ./install.sh.\n\n' >&2
+    "$ROOT/scripts/checkdeps.sh" || true
+    exit 1
+fi
+
+printf 'Package dependency installation verified.\n'

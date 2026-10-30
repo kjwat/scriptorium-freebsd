@@ -1,0 +1,43 @@
+# SimpleFiles config
+# Installed to ~/.config/simplefiles/config
+
+OPEN_MODE=terminal
+EDITOR_COMMAND=simplewords
+
+TEXT_EXTENSIONS=.txt,.md,.markdown,.tex,.c,.h,.cpp,.hpp,.cc,.py,.sh,.conf,.ini,.log
+
+PREVIEW=true
+PREVIEW_LINES=80
+
+# Empty uses the freedesktop trash for the file's own filesystem. This keeps
+# large external-drive deletions on that drive instead of copying them home.
+TRASH_DIR=
+CONFIRM_DELETE=true
+
+# File associations
+OPEN_.pdf=evince
+OPEN_.epub=simplebook
+OPEN_.mobi=simplebook
+OPEN_.azw=simplebook
+OPEN_.azw3=simplebook
+
+OPEN_.flac=simpleflac
+OPEN_.mp3=simpleflac
+OPEN_.ogg=simpleflac
+OPEN_.wav=simpleflac
+OPEN_.m4a=simpleflac
+OPEN_.aac=simpleflac
+OPEN_.opus=simpleflac
+OPEN_.ape=simpleflac
+OPEN_.cue=simpleflac
+
+OPEN_.m3u=simpleradio
+OPEN_.m3u8=simpleradio
+OPEN_.pls=simpleradio
+
+OPEN_.mp4=simpleplay
+OPEN_.mkv=simpleplay
+OPEN_.avi=simpleplay
+OPEN_.mpeg=simpleplay
+OPEN_.web3=simpleplay
+OPEN_.webm=simpleplay

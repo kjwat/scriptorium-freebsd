@@ -1,0 +1,908 @@
+#!/usr/bin/env bash
+set -u
+
+ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+. "$ROOT/scripts/resolve-simpleserve-role.sh"
+network_role=$(scriptorium_resolve_simpleserve_role) || exit $?
+if [[ $network_role == none ]]; then
+    install_simpleserve=0
+else
+    install_simpleserve=1
+fi
+
+missing_required=()
+missing_runtime=()
+missing_optional=()
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+have_pkgconfig() { pkg-config --exists "$1" >/dev/null 2>&1; }
+
+check_conversion_engines() {
+    local calibre_dir calibre_found=0
+    if have_cmd ebook-convert && have_cmd calibre-debug; then calibre_found=1; fi
+    for calibre_dir in /opt/calibre /Applications/calibre.app/Contents/MacOS; do
+        if [[ -x $calibre_dir/ebook-convert && -x $calibre_dir/calibre-debug ]]; then
+            calibre_found=1
+        fi
+    done
+    if [[ $calibre_found == 1 ]]; then
+        echo 'FOUND:   Calibre (ebook-convert and calibre-debug; SimpleChange ebooks/PDF)'
+    else
+        echo 'MISSING: Calibre (ebook-convert and calibre-debug; SimpleChange ebooks/PDF)'
+        add_missing runtime Calibre
+    fi
+    if have_cmd soffice || have_cmd libreoffice ||
+       [[ -x /Applications/LibreOffice.app/Contents/MacOS/soffice ]]; then
+        echo 'FOUND:   LibreOffice (Writer and Calc; SimpleChange documents/spreadsheets)'
+    else
+        echo 'MISSING: LibreOffice (Writer and Calc; SimpleChange documents/spreadsheets)'
+        add_missing runtime LibreOffice
+    fi
+}
+
+simplevol_pkg_hint() {
+    case "$family" in
+        debian) echo "python3 pulseaudio-utils pipewire-bin pipewire-pulse wireplumber lsp-plugins-lv2" ;;
+        arch) echo "python libpulse pipewire pipewire-audio pipewire-pulse wireplumber lsp-plugins-lv2" ;;
+        void) echo "python3 pulseaudio-utils pipewire wireplumber lsp-plugins-lv2" ;;
+        alpine) echo "python3 pulseaudio-utils pipewire pipewire-tools pipewire-pulse wireplumber lsp-plugins-lv2" ;;
+        fedora) echo "python3 pulseaudio-utils pipewire pipewire-utils pipewire-pulseaudio wireplumber lsp-plugins-lv2" ;;
+        suse) echo "python3 pulseaudio-utils pipewire pipewire-tools pipewire-pulseaudio wireplumber lsp-plugins" ;;
+        *) echo "Python 3, PipeWire with PulseAudio and LV2 support, WirePlumber, LSP LV2 plugins" ;;
+    esac
+}
+
+check_simplevol() {
+    local level=${1:-optional} dependency
+    for dependency in python3 pactl pipewire pipewire-pulse pw-cli pw-dump wireplumber; do
+        check_cmd "$level" "$dependency" "$dependency"
+    done
+    # Inspect plugin metadata without connecting to or starting an audio server.
+    if have_cmd python3 && python3 - <<'PY' >/dev/null 2>&1
+# SimpleVol LV2 availability
+import ctypes as C
+import ctypes.util
+import os
+from pathlib import Path
+
+bundle = Path(os.environ.get("SIMPLESUITE_DATADIR", os.environ.get(
+    "SIMPLESUITE_SYSTEM_DATA_DIR", "/usr/local/share/simplesuite"))) / "lv2"
+if bundle.is_dir():
+    defaults = str(Path.home() / ".lv2") + ":/usr/local/lib/lv2:/usr/lib/lv2:/usr/lib64/lv2"
+    os.environ["LV2_PATH"] = str(bundle) + ":" + os.environ.get("LV2_PATH", defaults)
+library = C.util.find_library("lilv-0")
+if not library:
+    raise SystemExit(1)
+lib = C.CDLL(library)
+pointer = C.c_void_p
+for name, result, args in (
+    ("world_new", pointer, []), ("world_load_all", None, [pointer]),
+    ("world_get_all_plugins", pointer, [pointer]),
+    ("new_uri", pointer, [pointer, C.c_char_p]),
+    ("new_string", pointer, [pointer, C.c_char_p]),
+    ("plugins_get_by_uri", pointer, [pointer, pointer]),
+    ("plugin_get_port_by_symbol", pointer, [pointer, pointer]),
+    ("node_free", None, [pointer]), ("world_free", None, [pointer]),
+):
+    function = getattr(lib, "lilv_" + name)
+    function.restype, function.argtypes = result, args
+world = lib.lilv_world_new()
+try:
+    lib.lilv_world_load_all(world)
+    plugins = lib.lilv_world_get_all_plugins(world)
+    for name in ("compressor_stereo", "autogain_stereo", "limiter_stereo"):
+        uri = lib.lilv_new_uri(world, ("http://lsp-plug.in/plugins/lv2/" + name).encode())
+        symbol = lib.lilv_new_string(world, b"enabled")
+        try:
+            plugin = lib.lilv_plugins_get_by_uri(plugins, uri)
+            if not plugin or not lib.lilv_plugin_get_port_by_symbol(plugin, symbol):
+                raise SystemExit(1)
+        finally:
+            lib.lilv_node_free(uri)
+            lib.lilv_node_free(symbol)
+finally:
+    lib.lilv_world_free(world)
+PY
+    then
+        printf 'FOUND:   SimpleVol effects (Lilv and LSP compressor, autogain, limiter)\n'
+    else
+        printf 'MISSING: SimpleVol effects (%s; requires LSP enabled controls, tested with 1.2.21)\n' "$(simplevol_pkg_hint)"
+        add_missing "$level" "SimpleVol effects"
+    fi
+}
+
+add_missing() {
+    case "$1" in
+        required) missing_required+=("$2") ;;
+        runtime)  missing_runtime+=("$2") ;;
+        optional) missing_optional+=("$2") ;;
+    esac
+}
+
+dep_hint() {
+    case "$1" in
+        cc) echo "provided by gcc or clang" ;;
+        make) echo "provided by make/build tools" ;;
+        python3) echo "used by SimpleChange and SimpleBrowse helpers" ;;
+        pkg-config) echo "provided by pkg-config or pkgconf" ;;
+        xdg-open) echo "Linux desktop helper; provided by xdg-utils; used by simplefiles external-open" ;;
+        open) echo "macOS built-in external-open helper" ;;
+        pdftotext|pdfinfo|pdftohtml|pdftoppm) echo "provided by Poppler; used by SimpleBook and SimpleChange" ;;
+        pandoc) echo "used by SimpleBook EPUB support and SimpleChange documents/ebooks" ;;
+        c44|djvm|djvused|djvutxt|ddjvu) echo "provided by DjVuLibre; used by SimpleChange DjVu conversions" ;;
+        simpleplay-core) echo "built by the SimplePlay installer; audio apps and alarms" ;;
+        git) echo "used by simplever" ;;
+        mbsync) echo "provided by isync; used by simplemail synchronization" ;;
+        msmtp) echo "used by simplemail sending" ;;
+        curl) echo "command-line HTTP client used during setup and maintenance" ;;
+        calcurse) echo "standalone calendar covered by the managed calcurse config" ;;
+        rsync) echo "used by Scriptorium file synchronization workflows" ;;
+        pactl|parec) echo "used by SimpleVol mixing and SimpleVis capture; provided by pulseaudio-utils/libpulse" ;;
+        pipewire|pipewire-pulse|pw-cli|pw-dump|wireplumber) echo "used by SimpleVol effects; $(simplevol_pkg_hint)" ;;
+        zip) echo "used by simplesave and simplefiles :compress" ;;
+        unzip) echo "used by simplefiles :extract" ;;
+        tar) echo "used by simplefiles :extract for TAR archives" ;;
+        findmnt) echo "provided by util-linux; used by simplefiles :unmount validation" ;;
+        udisksctl) echo "provided by udisks2; used by SimpleFiles mount recovery and unmount" ;;
+        bsdisks) echo "FreeBSD UDisks2 service used by GIO removable-volume discovery" ;;
+        e2fsck) echo "ext2/3/4 check and repair utility; provided by e2fsprogs" ;;
+        fsck.fat) echo "FAT check and repair utility; provided by dosfstools" ;;
+        fsck.exfat) echo "exFAT check and repair utility; provided by exfatprogs" ;;
+        exfatfsck) echo "FreeBSD exFAT check and repair utility; provided by exfat-utils" ;;
+        ntfsfix) echo "NTFS check and limited repair utility; provided by ntfs-3g/ntfsprogs, ntfs-3g-progs on Alpine, or fusefs-ntfs" ;;
+        mount.exfat) echo "FreeBSD exFAT mount helper; provided by fusefs-exfat" ;;
+        umount) echo "base system/util-linux; used by simpleburn and simplefiles :unmount" ;;
+        lsblk) echo "provided by util-linux; used by simpleburn drive selection on Linux" ;;
+        dd) echo "base system image writer used by simpleburn" ;;
+        sudo) echo "administrator authentication for simpleburn and system installation" ;;
+        crontab) echo "cron fallback for SimpleCal/SimpleClock reminders when systemd user services are unavailable" ;;
+        file) echo "optional helper for file type detection" ;;
+        less) echo "optional pager" ;;
+        fzf) echo "used by simpleburn ISO selection" ;;
+        links) echo "default terminal browser used by simplenews; configurable" ;;
+        gio) echo "provided by glib; used by simplefiles desktop open/trash/unmount features" ;;
+        wl-copy|wl-paste) echo "provided by wl-clipboard; used by simplewords Wayland clipboard" ;;
+        xclip|xsel) echo "used by simplewords X11 clipboard" ;;
+        avahi-daemon) echo "SimpleServe mDNS service; provided by Avahi" ;;
+        avahi-browse|avahi-publish-service) echo "SimpleServe mDNS discovery; provided by Avahi command-line utilities" ;;
+        exportfs) echo "SimpleServe Linux NFS export manager; provided by the NFS server package" ;;
+        mount.nfs) echo "SimpleServe Linux kernel NFS mount helper; provided by NFS client utilities" ;;
+        mount.cifs) echo "SMB client mount helper; provided by cifs-utils" ;;
+        smbd) echo "SimpleServe Linux SMB server; provided by Samba" ;;
+        testparm) echo "SimpleServe Samba configuration validator; provided by Samba" ;;
+        ssh) echo "OpenSSH client installed on every Trident machine" ;;
+        sshd) echo "OpenSSH daemon installed on every Trident machine" ;;
+        mount_nfs|nfsd) echo "SimpleServe FreeBSD NFS support; provided by the base system" ;;
+        blkid) echo "SimpleServe filesystem UUID lookup; provided by util-linux or e2fsprogs" ;;
+        *) echo "provided by $1" ;;
+    esac
+}
+
+pc_hint() {
+    case "$1" in
+        ncursesw) echo "provided by ncurses development package" ;;
+        gio-2.0) echo "provided by GLib/GIO development package; used by simplefiles removable-volume discovery" ;;
+        libcurl) echo "provided by libcurl/curl development package; used by simplebrowse, simplepod, and simplenews" ;;
+        openssl) echo "provided by OpenSSL development package; used by simplepod PodcastIndex authentication" ;;
+        evince-view-3.0|evince-document-3.0) echo "provided by $(pkg_for_dep "$1"); used by SimplePDF" ;;
+        libnm) echo "provided by $(pkg_for_dep libnm); used by the default SimpleNet Linux build" ;;
+        avahi-client) echo "native SimpleServe discovery; provided by Avahi client development headers and libraries" ;;
+    esac
+}
+
+js_pkg_hint() {
+    case "$family" in
+        debian) echo "python3 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1" ;;
+        arch) echo "python python-gobject webkit2gtk-4.1" ;;
+        fedora) echo "python3 python3-gobject webkit2gtk4.1" ;;
+        alpine) echo "python3 py3-gobject3 webkit2gtk-4.1" ;;
+        void) echo "python3 python3-gobject libwebkit2gtk41" ;;
+        suse) echo "python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1" ;;
+        macos) echo "built in: SimpleBrowse uses the system WKWebView framework" ;;
+        freebsd) echo "python3 devel/py-pygobject webkit2-gtk_41" ;;
+        *) echo "python3 python3-gobject WebKit2GTK-4.1 introspection" ;;
+    esac
+}
+
+check_simplebrowse_js() {
+    if [ "$family" = macos ]; then
+        printf "FOUND:   %-16s (%s)\n" "SimpleBrowse JS" \
+            "native WKWebView helper is built with SimpleSuite"
+        return
+    fi
+
+    if ! have_cmd python3; then
+        printf "MISSING: %-16s (%s; %s)\n" "SimpleBrowse JS" "python3" "$(dep_hint python3)"
+        add_missing optional "SimpleBrowse JS: $(js_pkg_hint)"
+        return
+    fi
+
+    if python3 - <<'PY' >/dev/null 2>&1
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("WebKit2", "4.1")
+from gi.repository import Gtk, WebKit2
+PY
+    then
+        printf "FOUND:   %-16s (%s)\n" "SimpleBrowse JS" "WebKitGTK 4.1 via Python GI"
+    else
+        printf "MISSING: %-16s (%s)\n" "SimpleBrowse JS" "$(js_pkg_hint)"
+        add_missing optional "SimpleBrowse JS: $(js_pkg_hint)"
+    fi
+}
+
+check_macos_audio_capture() {
+    version=
+    major=0
+    minor=0
+
+    if have_cmd sw_vers; then
+        version=$(sw_vers -productVersion 2>/dev/null || true)
+    fi
+    case "$version" in
+        [0-9]*)
+            major=${version%%.*}
+            remainder=${version#*.}
+            if [ "$remainder" != "$version" ]; then
+                minor=${remainder%%.*}
+            fi
+            ;;
+    esac
+    case "$major:$minor" in
+        *[!0-9:]*) major=0; minor=0 ;;
+    esac
+    if [ "$major" -gt 14 ] ||
+       { [ "$major" -eq 14 ] && [ "$minor" -ge 2 ]; }; then
+        printf "FOUND:   %-16s (%s)\n" "SimpleVis capture" \
+            "native Core Audio tap; macOS $version"
+    else
+        printf "MISSING: %-16s (%s)\n" "SimpleVis capture" \
+            "native system audio needs macOS 14.2 or newer"
+        add_missing optional "SimpleVis native capture (macOS 14.2+)"
+    fi
+}
+
+check_cmd() {
+    bucket="$1"
+    cmd="$2"
+    label="$3"
+
+    if have_cmd "$cmd"; then
+        printf "FOUND:   %-16s (%s)\n" "$label" "$cmd"
+    else
+        printf "MISSING: %-16s (%s; %s)\n" "$label" "$cmd" "$(dep_hint "$cmd")"
+        add_missing "$bucket" "$label"
+    fi
+}
+
+is_gnu_make() {
+    "$1" --version 2>/dev/null | grep -q 'GNU Make'
+}
+
+check_make() {
+    if [ "$family" = macos ] || [ "$family" = freebsd ]; then
+        if have_cmd make && is_gnu_make make; then
+            printf "FOUND:   %-16s (%s)\n" "GNU make" "make"
+        elif have_cmd gmake && is_gnu_make gmake; then
+            printf "FOUND:   %-16s (%s)\n" "GNU make" "gmake"
+        else
+            if [ "$family" = freebsd ]; then
+                make_hint="pkg install gmake"
+            else
+                make_hint="brew install make"
+            fi
+            printf "MISSING: %-16s (%s)\n" "GNU make" "$make_hint"
+            add_missing required "GNU make"
+        fi
+    else
+        check_cmd required make "make"
+    fi
+}
+
+check_pc() {
+    bucket="$1"
+    pc="$2"
+    label="$3"
+    pc_requirement="${4:-$pc}"
+
+    if have_pkgconfig "$pc_requirement"; then
+        printf "FOUND:   %-16s (pkg-config: %s)\n" "$label" "$pc_requirement"
+    else
+        printf "MISSING: %-16s (pkg-config: %s; %s)\n" "$label" "$pc_requirement" "$(pc_hint "$pc")"
+        add_missing "$bucket" "$label"
+    fi
+}
+
+check_any_editor() {
+    if have_cmd nano || have_cmd vim || have_cmd nvim || have_cmd emacs || have_cmd micro; then
+        printf "FOUND:   %-16s " "external editor"
+        first=1
+        for ed in nano vim nvim emacs micro; do
+            if have_cmd "$ed"; then
+                if [ "$first" -eq 1 ]; then
+                    printf "(%s" "$ed"
+                    first=0
+                else
+                    printf ", %s" "$ed"
+                fi
+            fi
+        done
+        printf ")\n"
+    else
+        echo "MISSING: external editor  (optional; nano recommended)"
+        add_missing optional "external editor"
+    fi
+}
+
+configure_homebrew_pkgconfig() {
+    [ "$family" = macos ] || return 0
+    if ! have_cmd brew; then
+        for brew_candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+            [ -x "$brew_candidate" ] || continue
+            PATH="${brew_candidate%/*}:$PATH"
+            export PATH
+            break
+        done
+    fi
+    have_cmd brew || return 0
+
+    for formula in ncurses glib curl openssl@3; do
+        formula_prefix="$(brew --prefix "$formula" 2>/dev/null)" || continue
+        for pkgconfig_dir in "$formula_prefix/lib/pkgconfig" \
+                             "$formula_prefix/share/pkgconfig"; do
+            [ -d "$pkgconfig_dir" ] || continue
+            case ":${PKG_CONFIG_PATH:-}:" in
+                *":$pkgconfig_dir:"*) ;;
+                *) PKG_CONFIG_PATH="$pkgconfig_dir${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" ;;
+            esac
+        done
+    done
+    export PKG_CONFIG_PATH
+}
+
+detect_platform() {
+    os="$(uname -s 2>/dev/null || echo unknown)"
+    distro="unknown"
+    family="$("$ROOT/scripts/detect-platform.sh")"
+    if [ "$family" = unknown ] && have_cmd pacman; then
+        family=arch
+    fi
+    wsl=0
+
+    case "$os" in
+        Darwin) distro="macos"; return ;;
+        FreeBSD) distro="freebsd"; return ;;
+        MINGW*|MSYS*|CYGWIN*) distro="windows"; return ;;
+    esac
+
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+        wsl=1
+    fi
+
+    if [ -r /etc/os-release ]; then
+        distro="$(awk -F= '
+            $1 == "ID" {
+                value = substr($0, index($0, "=") + 1)
+                gsub(/^['\''"]|['\''"]$/, "", value)
+                print value
+                exit
+            }
+        ' /etc/os-release)"
+        [ -n "$distro" ] || distro=unknown
+    fi
+}
+
+pkg_for_dep() {
+    case "$family:$1" in
+        *:evince-view-3.0|*:evince-document-3.0)
+            case "$family" in
+                debian) echo "libevince-dev" ;;
+                arch | freebsd) echo "evince" ;;
+                alpine) echo "evince-dev" ;;
+                void | fedora | suse) echo "evince-devel" ;;
+                *) echo "Evince 3 development files" ;;
+            esac
+            ;;
+        *:"SimpleVol effects"|*:pipewire|*:pipewire-pulse|*:pw-cli|*:pw-dump|*:wireplumber) simplevol_pkg_hint ;;
+        debian:libnm) echo "libnm-dev" ;;
+        void:libnm|suse:libnm) echo "NetworkManager-devel" ;;
+        arch:libnm) echo "libnm" ;;
+        alpine:libnm) echo "networkmanager-dev" ;;
+        fedora:libnm) echo "NetworkManager-libnm-devel" ;;
+        *:libnm) echo "libnm development files" ;;
+        *:fzf) echo "fzf" ;;
+        *:zip) echo "zip" ;;
+        *:unzip) echo "unzip" ;;
+        *:tar) echo "tar" ;;
+        *:file)
+            case "$family" in
+                macos) echo "libmagic" ;;
+                *) echo "file" ;;
+            esac
+            ;;
+        *:less) echo "less" ;;
+        *:calcurse) echo "calcurse" ;;
+        *:rsync) echo "rsync" ;;
+        *:xdg-open) echo "xdg-utils" ;;
+        *:findmnt) echo "util-linux" ;;
+        *:lsblk) echo "util-linux" ;;
+        *:sudo) echo "sudo" ;;
+        *:dd)
+            case "$family" in
+                macos|freebsd) echo "base system" ;;
+                *) echo "coreutils" ;;
+            esac
+            ;;
+        *:udisksctl) echo "udisks2" ;;
+        *:bsdisks) echo "bsdisks" ;;
+        *:e2fsck) echo "e2fsprogs" ;;
+        *:fsck.fat) echo "dosfstools" ;;
+        *:fsck.exfat) echo "exfatprogs" ;;
+        *:exfatfsck) echo "exfat-utils" ;;
+        *:mount.exfat) echo "fusefs-exfat" ;;
+        *:ntfsfix)
+            case "$family" in
+                freebsd) echo "fusefs-ntfs" ;;
+                alpine) echo "ntfs-3g-progs" ;;
+                arch | fedora | suse) echo "ntfsprogs" ;;
+                *) echo "ntfs-3g" ;;
+            esac
+            ;;
+        *:crontab)
+            case "$family" in
+                alpine) echo "dcron" ;;
+                arch | fedora | void) echo "cronie" ;;
+                *) echo "cron" ;;
+            esac
+            ;;
+        *:pactl|*:parec)
+            case "$family" in
+                arch) echo "libpulse" ;;
+                macos | freebsd) echo "pulseaudio" ;;
+                *) echo "pulseaudio-utils" ;;
+            esac
+            ;;
+        *:links) echo "links" ;;
+        *:gio)
+            case "$family" in
+                debian) echo "libglib2.0-bin" ;;
+                arch|fedora) echo "glib2" ;;
+                suse) echo "glib2-tools" ;;
+                *) echo "glib" ;;
+            esac
+            ;;
+        *:wl-copy|*:wl-paste) echo "wl-clipboard" ;;
+        *:xclip) echo "xclip" ;;
+        *:xsel)
+            case "$family" in
+                freebsd) echo "xsel-conrad" ;;
+                *) echo "xsel" ;;
+            esac
+            ;;
+        *:avahi-browse|*:avahi-publish-service)
+            case "$family" in
+                freebsd) echo "avahi-app" ;;
+                debian) echo "avahi-daemon avahi-utils" ;;
+                alpine) echo "avahi avahi-openrc avahi-tools" ;;
+                fedora) echo "avahi avahi-tools" ;;
+                *) echo "avahi" ;;
+            esac
+            ;;
+        *:exportfs)
+            case "$family" in
+                debian) echo "nfs-kernel-server" ;;
+                suse) echo "nfs-kernel-server" ;;
+                alpine) echo "nfs-utils nfs-utils-openrc" ;;
+                *) echo "nfs-utils" ;;
+            esac
+            ;;
+        *:mount.nfs)
+            case "$family" in
+                debian) echo "nfs-common" ;;
+                suse) echo "nfs-client" ;;
+                alpine) echo "nfs-utils nfs-utils-openrc" ;;
+                *) echo "nfs-utils" ;;
+            esac
+            ;;
+        *:smbd|*:testparm)
+            case "$family" in
+                alpine) echo "samba samba-server-openrc" ;;
+                *) echo "samba" ;;
+            esac
+            ;;
+        *:blkid)
+            case "$family" in
+                freebsd) echo "e2fsprogs" ;;
+                *) echo "util-linux" ;;
+            esac
+            ;;
+        *:"SimpleBrowse JS:"*) js_pkg_hint ;;
+        *) echo "" ;;
+    esac
+}
+
+
+packages_for_family() {
+    local simpleserve_packages=
+
+    if [ "$install_simpleserve" -eq 1 ]; then
+        case "$family" in
+            void) simpleserve_packages="avahi-libs-devel nfs-utils avahi avahi-utils cifs-utils openssh" ;;
+            arch) simpleserve_packages="nfs-utils avahi cifs-utils openssh" ;;
+            debian) simpleserve_packages="libavahi-client-dev nfs-common avahi-daemon avahi-utils cifs-utils openssh-client openssh-server" ;;
+            fedora) simpleserve_packages="avahi-devel nfs-utils avahi avahi-tools cifs-utils openssh-clients openssh-server" ;;
+            alpine) simpleserve_packages="avahi-dev nfs-utils avahi avahi-openrc avahi-tools cifs-utils openssh" ;;
+            suse) simpleserve_packages="libavahi-devel nfs-client avahi avahi-utils cifs-utils openssh openssh-server" ;;
+            freebsd) simpleserve_packages="avahi-app" ;;
+        esac
+        if [ "$network_role" = server ]; then
+            case "$family" in
+                debian | suse) simpleserve_packages="$simpleserve_packages nfs-kernel-server samba" ;;
+                void | arch | fedora) simpleserve_packages="$simpleserve_packages samba" ;;
+                alpine) simpleserve_packages="$simpleserve_packages nfs-utils-openrc samba samba-server-openrc" ;;
+                freebsd) simpleserve_packages="$simpleserve_packages e2fsprogs" ;;
+            esac
+        fi
+    fi
+    case "$family" in
+        void)
+            INSTALL="sudo xbps-install -Sy"
+            PKG_REQUIRED="evince-devel base-devel pkg-config ncurses-devel glib-devel libcurl-devel openssl-devel"
+            PKG_RUNTIME="git poppler-utils pandoc isync msmtp calcurse links curl ca-certificates rsync util-linux $simpleserve_packages"
+            PKG_OPTIONAL="nano zip unzip tar xdg-utils file less fzf pulseaudio-utils glib udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g wl-clipboard xclip xsel python3 python3-gobject libwebkit2gtk41 cronie"
+            ;;
+        debian)
+            INSTALL="sudo apt-get update && sudo apt-get install -y"
+            PKG_REQUIRED="libevince-dev poppler-data build-essential pkg-config libncurses-dev libglib2.0-dev libcurl4-openssl-dev libssl-dev"
+            PKG_RUNTIME="git poppler-utils pandoc isync msmtp calcurse links curl ca-certificates rsync util-linux $simpleserve_packages"
+            PKG_OPTIONAL="nano zip unzip tar xdg-utils file less fzf pulseaudio-utils libglib2.0-bin udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g wl-clipboard xclip xsel python3 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1 cron"
+            ;;
+        arch)
+            INSTALL="sudo pacman -S --needed"
+            PKG_REQUIRED="evince base-devel pkgconf ncurses glib2 curl openssl"
+            PKG_RUNTIME="git poppler pandoc-cli isync msmtp calcurse links ca-certificates rsync util-linux $simpleserve_packages"
+            arch_audio="libpulse"
+
+            if ! pacman -Qq pipewire-jack >/dev/null 2>&1 &&
+               ! pacman -Qq jack2 >/dev/null 2>&1; then
+                arch_audio="$arch_audio pipewire-jack"
+            fi
+
+            PKG_OPTIONAL="nano zip unzip tar xdg-utils file less fzf $arch_audio udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g ntfsprogs wl-clipboard xclip xsel python python-gobject webkit2gtk-4.1 cronie"
+            ;;
+        fedora)
+            INSTALL="sudo dnf install -y"
+            PKG_REQUIRED="evince-devel gcc make pkgconf-pkg-config ncurses-devel glib2-devel libcurl-devel openssl-devel"
+            PKG_RUNTIME="git poppler-utils pandoc isync msmtp calcurse links curl ca-certificates rsync util-linux $simpleserve_packages"
+            PKG_OPTIONAL="nano zip unzip tar xdg-utils file less fzf pulseaudio-utils glib2 udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g ntfsprogs wl-clipboard xclip xsel python3 python3-gobject webkit2gtk4.1 cronie"
+            ;;
+        alpine)
+            INSTALL="sudo apk add"
+            PKG_REQUIRED="evince-dev build-base bash pkgconf ncurses-dev glib-dev curl-dev openssl-dev"
+            PKG_RUNTIME="git poppler-utils pandoc isync msmtp calcurse links curl ca-certificates rsync util-linux $simpleserve_packages"
+            PKG_OPTIONAL="nano zip unzip tar xdg-utils file less fzf pulseaudio-utils glib udisks2 gvfs e2fsprogs dosfstools exfatprogs ntfs-3g ntfs-3g-progs wl-clipboard xclip xsel python3 py3-gobject3 webkit2gtk-4.1 dcron"
+            ;;
+        suse)
+            INSTALL="sudo zypper install"
+            PKG_REQUIRED="evince-devel gcc make pkg-config ncurses-devel glib2-devel libcurl-devel libopenssl-devel"
+            PKG_RUNTIME="git poppler-tools pandoc isync msmtp calcurse links curl ca-certificates rsync util-linux $simpleserve_packages"
+            PKG_OPTIONAL="nano zip unzip tar xdg-utils file less fzf pulseaudio-utils glib2-tools udisks2 gvfs-backends e2fsprogs dosfstools exfatprogs ntfs-3g ntfsprogs wl-clipboard xclip xsel python3 python3-gobject typelib-1_0-Gtk-3_0 typelib-1_0-WebKit2-4_1 cron"
+            ;;
+        macos)
+            INSTALL="brew install"
+            PKG_REQUIRED="pkgconf ncurses curl make openssl@3 glib"
+            PKG_RUNTIME="git poppler pandoc isync msmtp calcurse links rsync"
+            PKG_OPTIONAL="nano zip unzip libmagic less fzf"
+            ;;
+        freebsd)
+            INSTALL="sudo pkg install"
+            PKG_REQUIRED="evince bash gmake pkgconf ncurses glib curl openssl"
+            PKG_RUNTIME="git poppler-utils hs-pandoc isync msmtp calcurse links ca_root_nss rsync e2fsprogs $simpleserve_packages"
+            PKG_OPTIONAL="nano zip unzip gtar xdg-utils file less fzf pulseaudio bsdisks gvfs exfat-utils fusefs-exfat fusefs-ntfs wl-clipboard xclip xsel-conrad python3 devel/py-pygobject webkit2-gtk_41"
+            ;;
+        msys2)
+            INSTALL="pacman -S --needed"
+            PKG_REQUIRED="base-devel mingw-w64-x86_64-toolchain mingw-w64-x86_64-pkgconf mingw-w64-x86_64-ncurses mingw-w64-x86_64-curl"
+            PKG_RUNTIME="git mingw-w64-x86_64-poppler pandoc"
+            PKG_OPTIONAL="nano zip unzip file less fzf"
+            ;;
+        *)
+            INSTALL="# install manually:"
+            PKG_REQUIRED="gcc make pkg-config ncurses-devel libcurl-devel libopenssl-devel"
+            PKG_RUNTIME="git poppler-utils pandoc"
+            PKG_OPTIONAL="nano zip unzip xdg-utils file less fzf pulseaudio-utils glib wl-clipboard xclip xsel links python3 python3-gobject WebKit2GTK-4.1"
+            ;;
+    esac
+    case "$family" in
+        debian) PKG_RUNTIME="$PKG_RUNTIME python3 calibre libreoffice-writer libreoffice-calc djvulibre-bin" ;;
+        arch) PKG_RUNTIME="$PKG_RUNTIME python calibre libreoffice-fresh djvulibre" ;;
+        void|alpine|fedora|suse) PKG_RUNTIME="$PKG_RUNTIME python3 calibre libreoffice-writer libreoffice-calc djvulibre" ;;
+        freebsd) PKG_RUNTIME="$PKG_RUNTIME python3 calibre libreoffice djvulibre" ;;
+        macos) PKG_RUNTIME="$PKG_RUNTIME python djvulibre" ;;
+    esac
+    if [ "$os" = Linux ] && [ "${SIMPLENET_WITH_NM:-1}" != 0 ]; then
+        PKG_REQUIRED="$PKG_REQUIRED $(pkg_for_dep libnm)"
+    fi
+}
+
+echo "Checking SimpleSuite dependencies..."
+echo
+
+detect_platform
+configure_homebrew_pkgconfig
+packages_for_family
+
+if [ "${1:-}" = --simplevol ]; then
+    if [ "$os" = Linux ]; then
+        check_simplevol runtime
+    fi
+    [ "${#missing_runtime[@]}" -eq 0 ]
+    exit $?
+fi
+
+echo "Detected distro/platform: $distro"
+echo "Detected family: $family"
+[ "${wsl:-0}" = 1 ] && echo "WSL detected: yes"
+echo
+
+echo "=== Required build dependencies ==="
+check_cmd required cc "C compiler"
+check_make
+check_cmd required pkg-config "pkg-config"
+check_pc  required ncursesw "ncursesw"
+check_pc  required gio-2.0 "GIO"
+check_pc  required libcurl "libcurl"
+check_pc  required openssl "OpenSSL"
+case "$os" in
+    Linux | FreeBSD | Darwin)
+        check_cmd required c++ "C++ compiler"
+        check_cmd required glib-compile-resources "GLib resource compiler"
+        check_pc required gtk+-3.0 "GTK 3" 'gtk+-3.0 >= 3.24'
+        check_pc required vte-2.91 "VTE" 'vte-2.91 >= 0.60'
+        check_pc required libpcre2-8 "PCRE2"
+        if [ "$os" != Darwin ]; then
+            check_pc required evince-view-3.0 "Evince GTK 3 view"
+            check_pc required evince-document-3.0 "Evince document backends"
+        fi
+        for media_library in cairo libavformat libavcodec libavutil libavfilter \
+            libswscale libswresample sdl2 libass fluidsynth libsidplayfp json-glib-1.0; do
+            check_pc required "$media_library" "$media_library"
+        done
+        ;;
+esac
+if [ "$os" = Linux ] && [ "${SIMPLENET_WITH_NM:-1}" != 0 ]; then
+    check_pc required libnm "NetworkManager client" 'libnm >= 1.24'
+fi
+if [ "$install_simpleserve" -eq 1 ] &&
+   [ "$family" != macos ] && [ "$family" != msys2 ]; then
+    check_pc required avahi-client "Avahi client"
+fi
+
+echo
+echo "=== Runtime dependencies ==="
+check_cmd runtime git "git"
+check_cmd runtime simpleplay-core "SimplePlay engine"
+check_cmd runtime pdftotext "pdftotext"
+check_cmd runtime pandoc "pandoc"
+check_cmd runtime python3 "python3"
+for conversion_tool in pdfinfo pdftohtml pdftoppm c44 djvm djvused djvutxt ddjvu; do
+    check_cmd runtime "$conversion_tool" "$conversion_tool"
+done
+check_conversion_engines
+check_cmd runtime mbsync "mbsync"
+check_cmd runtime msmtp "msmtp"
+check_cmd runtime curl "curl"
+
+if [ "$install_simpleserve" -eq 1 ] && [ "$family" != msys2 ]; then
+    check_cmd runtime ssh "OpenSSH client"
+    check_cmd runtime sshd "OpenSSH daemon"
+    if [ "$family" = macos ]; then
+        check_cmd runtime dns-sd "SimpleServe Bonjour"
+        check_cmd runtime launchctl "SimpleServe service manager"
+        check_cmd runtime mount_nfs "SimpleServe NFS client"
+    else
+        check_cmd runtime avahi-daemon "SimpleServe mDNS service"
+        check_cmd runtime avahi-browse "SimpleServe discovery"
+    fi
+    if [ "$family" = freebsd ]; then
+        check_cmd runtime mount_nfs "SimpleServe NFS client"
+    elif [ "$family" != macos ]; then
+        check_cmd runtime mount.nfs "SimpleServe NFS client"
+        check_cmd runtime mount.cifs "SMB client"
+    fi
+    if [ "$network_role" = server ]; then
+        if [ "$family" = macos ]; then
+            check_cmd runtime nfsd "SimpleServe NFS server"
+            check_cmd runtime sharing "SimpleServe SMB sharing"
+        else
+            check_cmd runtime avahi-publish-service "SimpleServe advertisement"
+            check_cmd runtime blkid "SimpleServe filesystem UUIDs"
+        fi
+        if [ "$family" = freebsd ]; then
+            check_cmd runtime nfsd "SimpleServe NFS server"
+        elif [ "$family" != macos ]; then
+            check_cmd runtime exportfs "SimpleServe NFS server"
+            check_cmd runtime smbd "SimpleServe SMB server"
+            check_cmd runtime testparm "SimpleServe SMB validation"
+        fi
+    fi
+fi
+
+echo
+echo "=== Optional / feature dependencies ==="
+check_any_editor
+check_cmd optional zip "zip"
+check_cmd optional unzip "unzip"
+check_cmd optional tar "tar"
+check_cmd optional file "file"
+check_cmd optional less "less"
+check_cmd optional fzf "fzf"
+case $(uname -s) in
+    Linux|FreeBSD|Darwin)
+        check_cmd optional dd "dd"
+        check_cmd optional sudo "sudo"
+        ;;
+esac
+if [ "$(uname -s)" = Linux ]; then
+    check_cmd optional lsblk "lsblk"
+fi
+check_cmd optional calcurse "calcurse"
+check_cmd optional rsync "rsync"
+
+if [ "$family" != "msys2" ]; then
+    check_cmd optional links "links"
+fi
+if [ "$family" != msys2 ]; then
+    check_simplebrowse_js
+fi
+
+if [ "$family" != "msys2" ]; then
+    check_cmd optional gio "gio"
+fi
+
+if [ "$family" = "macos" ]; then
+    check_cmd optional open "open"
+    check_macos_audio_capture
+elif [ "$family" = "freebsd" ]; then
+    if [ -x /usr/local/libexec/simplefiles-freebsd-unmount ]; then
+        printf "FOUND:   %-16s (%s)\n" "SimpleFiles helper" \
+            "/usr/local/libexec/simplefiles-freebsd-unmount"
+    else
+        printf "PENDING: %-16s (%s)\n" "SimpleFiles helper" \
+            "build.sh installs it during the SimpleSuite step"
+    fi
+    check_cmd optional bsdisks "FreeBSD UDisks2"
+    if [ -x /usr/local/libexec/gvfs-udisks2-volume-monitor ]; then
+        printf "FOUND:   %-16s (%s)\n" "GIO volume monitor" \
+            "gvfs-udisks2-volume-monitor"
+    else
+        printf "MISSING: %-16s (%s)\n" "GIO volume monitor" \
+            "provided by gvfs"
+        add_missing optional "gvfs"
+    fi
+    check_cmd optional e2fsck "e2fsck"
+    check_cmd optional exfatfsck "exfatfsck"
+    check_cmd optional mount.exfat "mount.exfat"
+    check_cmd optional ntfsfix "ntfsfix"
+    check_cmd optional umount "unmount utility"
+    check_cmd optional xdg-open "xdg-open"
+    check_cmd optional ifconfig "simplenet wireless discovery"
+    check_cmd optional route "simplenet routing"
+    check_cmd optional wpa_cli "simplenet backend"
+    if have_cmd xclip || have_cmd xsel; then
+        printf "FOUND:   %-16s (%s)\n" "X11 clipboard" \
+            "$(have_cmd xclip && echo xclip || echo xsel)"
+    else
+        printf "MISSING: %-16s (%s)\n" "X11 clipboard" "xclip or xsel"
+        add_missing optional "xclip"
+    fi
+elif [ "$family" != "msys2" ]; then
+    check_cmd optional findmnt "findmnt"
+    if have_cmd udisksctl || have_cmd umount; then
+        if have_cmd udisksctl; then
+            printf "FOUND:   %-16s (%s)\n" "unmount helper" "udisksctl"
+        else
+            printf "FOUND:   %-16s (%s)\n" "unmount helper" "umount"
+        fi
+    else
+        printf "MISSING: %-16s (%s)\n" "unmount helper" "udisksctl or umount"
+        add_missing optional "udisksctl"
+    fi
+    check_cmd optional udisksctl "UDisks2"
+    check_cmd optional e2fsck "e2fsck"
+    check_cmd optional fsck.fat "fsck.fat"
+    check_cmd optional fsck.exfat "fsck.exfat"
+    check_cmd optional ntfsfix "ntfsfix"
+
+    check_cmd optional xdg-open "xdg-open"
+    check_cmd optional wl-copy "wl-copy"
+    check_cmd optional wl-paste "wl-paste"
+
+    if have_cmd xclip || have_cmd xsel; then
+        if have_cmd xclip; then
+            printf "FOUND:   %-16s (%s)\n" "X11 clipboard" "xclip"
+        else
+            printf "FOUND:   %-16s (%s)\n" "X11 clipboard" "xsel"
+        fi
+    else
+        printf "MISSING: %-16s (%s)\n" "X11 clipboard" "xclip or xsel"
+        add_missing optional "xclip"
+    fi
+fi
+
+if [ "$family" != "msys2" ] && [ "$family" != macos ]; then
+    check_cmd optional pactl "pactl"
+    check_cmd optional parec "parec"
+fi
+
+if [ "$os" = Linux ]; then
+    check_simplevol optional
+fi
+
+if [ "$family" = macos ]; then
+    check_cmd optional launchctl "launchd reminder backend"
+elif have_cmd systemctl && systemctl --user show-environment >/dev/null 2>&1; then
+    printf "FOUND:   %-16s (%s)\n" "reminder backend" "systemd --user"
+else
+    check_cmd optional crontab "crontab"
+fi
+
+echo
+
+if [ "${#missing_required[@]}" -eq 0 ] &&
+   [ "${#missing_runtime[@]}" -eq 0 ] &&
+   [ "${#missing_optional[@]}" -eq 0 ]; then
+    echo "All checked dependencies are present."
+    exit 0
+fi
+
+if [ "${#missing_required[@]}" -gt 0 ]; then
+    echo "Missing REQUIRED build dependencies:"
+    printf "  - %s\n" "${missing_required[@]}"
+    echo
+    echo "Install required packages:"
+    echo "  $INSTALL $PKG_REQUIRED"
+    echo
+fi
+
+if [ "${#missing_runtime[@]}" -gt 0 ]; then
+    echo "Missing RUNTIME dependencies:"
+    printf "  - %s\n" "${missing_runtime[@]}"
+    echo
+    echo "Install runtime packages:"
+    echo "  $INSTALL $PKG_RUNTIME"
+    echo
+fi
+
+if [ "${#missing_optional[@]}" -gt 0 ]; then
+    echo "Missing OPTIONAL / feature dependencies:"
+    printf "  - %s\n" "${missing_optional[@]}"
+    echo
+
+    opt_pkgs=""
+    for dep in "${missing_optional[@]}"; do
+        pkg="$(pkg_for_dep "$dep")"
+        if [ -n "$pkg" ]; then
+            case " $opt_pkgs " in
+                *" $pkg "*) ;;
+                *) opt_pkgs="$opt_pkgs $pkg" ;;
+            esac
+        fi
+    done
+
+    if [ -n "$opt_pkgs" ]; then
+        echo "Install optional packages:"
+        echo "  $INSTALL $(printf "%s" "$opt_pkgs" | xargs)"
+        echo
+    fi
+fi
+
+echo "One-shot install for this platform:"
+echo "  $INSTALL $PKG_REQUIRED $PKG_RUNTIME $PKG_OPTIONAL"
+if [[ $family == macos ]]; then
+    echo '  brew install --cask calibre libreoffice'
+fi
+
+[ "${#missing_required[@]}" -gt 0 ] && exit 2
+[ "${#missing_runtime[@]}" -gt 0 ] && exit 1
+exit 0

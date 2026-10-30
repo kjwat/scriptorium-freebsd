@@ -1,0 +1,109 @@
+#EXTM3U
+
+#EXTINF:-1,WFMT Chicago
+http://stream.wfmt.com/main
+
+#EXTINF:-1,KBAQ Phoenix
+https://kbaq.streamguys1.com/kbaq_mp3_128
+
+#EXTINF:-1,Classical California (KDFC San Francisco)
+https://128.mp3.kusc.live
+
+#EXTINF:-1,WSHU All Classical
+https://wshu-iad.streamguys1.com/wshu-classical
+
+#EXTINF:-1,WCPE The Classical Station
+https://playerservices.streamtheworld.com/api/livestream-redirect/WCPE_FM.mp3
+
+#EXTINF:-1,WQXR New York
+http://stream.wqxr.org/wqxr
+
+#EXTINF:-1,Operavore
+https://stream.wqxr.org/operavore
+
+#EXTINF:-1,Venice Classic Radio Auditorium
+http://116.202.241.212:8010/stream
+
+#EXTINF:-1,Radio Swiss Classic
+https://stream.srg-ssr.ch/m/rsc_de/mp3_128
+
+#EXTINF:-1,RTÉ Lyric FM
+http://icecast.rte.ie/lyric
+
+#EXTINF:-1,YourClassical Radio
+https://ycradio.stream.publicradio.org/ycradio.aac
+
+#EXTINF:-1,Classical Minnesota Public Radio
+https://cms.stream.publicradio.org/cms.aac
+
+#EXTINF:-1,All Classical Radio
+https://allclassical.streamguys1.com/ac96k
+
+#EXTINF:-1,Classic FM UK
+http://media-ice.musicradio.com/ClassicFMMP3
+
+#EXTINF:-1,Radio Classique
+https://str0.creacast.com/classique1
+
+#EXTINF:-1,Rete Toscana Classica
+https://nr12.newradio.it:8744/stream
+
+#EXTINF:-1,Radio Enciclopedia Havana
+https://icecast.teveo.cu/9Rnrbjzq
+
+#EXTINF:-1,DR P1
+http://live-icy.gss.dr.dk/A/A03H.mp3
+
+#EXTINF:-1,Rai Radio 3
+https://icestreaming.rai.it/3.mp3
+
+#EXTINF:-1,France Musique
+https://direct.francemusique.fr/live/francemusique-midfi.mp3
+
+#EXTINF:-1,Classic FM Calm
+https://media-ice.musicradio.com/ClassicFMCalmMP3
+
+#EXTINF:-1,BR-KLASSIK
+https://dispatcher.rndfnk.com/br/brklassik/live/mp3/high
+
+#EXTINF:-1,100 Greatest Classical Music
+https://az1.mediacp.eu/listen/100greatestclassicalmusic/radio.mp3
+
+#EXTINF:-1,France Musique La Baroque
+https://icecast.radiofrance.fr/francemusiquebaroque-hifi.aac
+
+#EXTINF:-1,NPO Klassiek
+https://icecast.omroep.nl/radio4-bb-mp3
+
+#EXTINF:-1,Classic FM Movies
+https://media-ice.musicradio.com/ClassicFMMoviesMP3
+
+#EXTINF:-1,YourClassical Relax
+https://relax.stream.publicradio.org/relax.mp3
+
+#EXTINF:-1,YourClassical Peaceful Piano
+https://peacefulpiano.stream.publicradio.org/peacefulpiano.mp3
+
+#EXTINF:-1,NDR Kultur
+https://icecast.ndr.de/ndr/ndrkultur/live/mp3/128/stream.mp3
+
+#EXTINF:-1,WDR 3
+https://wdr-wdr3-live.icecast.wdr.de/wdr/wdr3/live/mp3/128/stream.mp3
+
+#EXTINF:-1,Classical KING Evergreen Channel
+https://classicalking.streamguys1.com/evergreen-aac-128k
+
+#EXTINF:-1,Rai Radio Classica
+https://icestreaming.rai.it/5.mp3
+
+#EXTINF:-1,Ancient FM
+https://mediaserv73.live-streams.nl:18058/stream
+
+#EXTINF:-1,Ottava
+https://ottava2.out.airtime.pro:8000/ottava2_a
+
+#EXTINF:-1,1.FM Otto's Baroque Music Radio
+https://strm112.1.fm/baroque_mobile_mp3
+
+#EXTINF:-1,EPIC CLASSICAL - Classical Piano
+https://stream.epic-classical.com/classical-piano

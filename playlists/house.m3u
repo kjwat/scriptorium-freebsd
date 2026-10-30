@@ -1,0 +1,87 @@
+#EXTM3U
+#EXTINF:-1,Zeno House Stream
+https://stream.zeno.fm/749dnw7yruquv
+
+#EXTINF:-1,Laut.fm House
+https://stream.laut.fm/house
+
+#EXTINF:-1,Radio Stream House 2
+https://server3.radio-streams.net:8028/stream2
+
+#EXTINF:-1,Radio Stream House
+https://server3.radio-streams.net:8028/;
+
+#EXTINF:-1,Housetime.fm
+https://aach.stream.tb-group.fm/ht-high.aac
+
+#EXTINF:-1,House Attack Radio
+https://virtualtronics.net/proxy/houseattack?mp=/stream
+
+#EXTINF:-1,Housebeats.FM
+https://mediaserv38.live-streams.nl:18048/stream
+
+#EXTINF:-1,Laut.fm House Beatz and Waves
+https://stream.laut.fm/house_beatz_and_waves
+
+#EXTINF:-1,Laut.fm House Industry
+https://stream.laut.fm/houseindustry
+
+#EXTINF:-1,Laut.fm Housemaxx
+https://stream.laut.fm/housemaxx
+
+#EXTINF:-1,House Music 101
+https://streaming.live365.com/a63370
+
+#EXTINF:-1,House Music Radio
+https://stream.zeno.fm/ubrbwq17qy8uv
+
+#EXTINF:-1,Laut.fm House Music Universe
+https://stream.laut.fm/housemusicuniverse
+
+#EXTINF:-1,House Music Radio 2
+https://server7.streamserver24.com/proxy/housemus2?mp=%2Fstream&fbclid=IwAR0ie0H2Kq3iZ10Nlij6EIQgSbiILi3grQ1BXNkiHMXuRy0XRstaqaX
+
+#EXTINF:-1,House FM
+https://uksoutha.streaming.broadcast.radio:19920/housefm
+
+#EXTINF:-1,Select Radio UK
+https://streaming05.liveboxstream.uk/proxy/selectr1/stream
+
+#EXTINF:-1,Centreforce 883
+https://listen.centreforceradio.com/96
+
+#EXTINF:-1,54house.fm
+https://54house.fm:9013/stream
+
+#EXTINF:-1,MoveDaHouse
+https://uk7.internet-radio.com/proxy/movedahouse?mp=//stream
+
+#EXTINF:-1,BeachGrooves Radio
+https://stream.beachgrooves.com:9000/stream.mp3
+
+#EXTINF:-1,Ibiza Sonica Club
+https://ibizasonica.streaming-pro.com:8011/sonicaclub
+
+#EXTINF:-1,Pure Ibiza Radio
+https://pureibizaradio.clubbingradios.com:9518/PureIbizaRadio
+
+#EXTINF:-1,Deep Motion FM
+https://vm.motionfm.com/motionone_free
+
+#EXTINF:-1,House Nation UK
+https://streaming.radio.co/s06bd9d805/listen
+
+#EXTINF:-1,Soulful House by Vip-Radios
+https://radio4.vip-radios.fm:18057/stream-128kmp3-SoulfulHouse
+
+#EXTINF:-1,Deep House Radio Bucharest
+https://live.dancemusic.ro:7000/stream
+
+#EXTINF:-1,Dinamo.fm Deep
+https://channels.dinamo.fm/deep-mp3
+
+#EXTINF:-1,Ibiza Global Radio
+https://ibizaglobalradio.streaming-pro.com:8024/
+
+#EXTINF:-1,1.FM Deep House
+https://strm112.1.fm/deephouse_mobile_mp3

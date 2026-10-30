@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/scriptorium-burn-check.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+
+export HOME="$TMP/home"
+FAKE_ROOT="$HOME/scriptorium"
+FAKE_SUITE="$HOME/simplesuite"
+FAKE_BIN="$TMP/test-bin"
+SYSTEM_BIN="$TMP/system-bin"
+SYSTEM_DATA="$TMP/system-share/simplesuite"
+REAL_BASH_DIR="$(dirname "$(command -v bash)")"
+mkdir -p "$FAKE_ROOT" "$FAKE_SUITE" "$FAKE_BIN" "$HOME/.local/bin" "$SYSTEM_BIN"
+cp "$SOURCE_ROOT/burn.sh" "$SOURCE_ROOT/burn-writing.sh" "$FAKE_ROOT/"
+
+fail() {
+    printf 'burn-check: %s\n' "$*" >&2
+    exit 1
+}
+
+assert_missing() {
+    [[ ! -e "$1" && ! -L "$1" ]] || fail "expected removal: $1"
+}
+
+for stub in systemctl crontab git; do
+    printf '%s\n' '#!/bin/sh' 'exit 0' >"$FAKE_BIN/$stub"
+    chmod 755 "$FAKE_BIN/$stub"
+done
+
+cat >"$FAKE_BIN/uname" <<'EOF'
+#!/bin/sh
+echo FreeBSD
+EOF
+chmod 755 "$FAKE_BIN/uname"
+
+cat >"$SYSTEM_BIN/simplesuite-uninstall" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >"$HOME/native-burn-args"
+exit 0
+EOF
+chmod 755 "$SYSTEM_BIN/simplesuite-uninstall"
+printf '%s\n' '#!/bin/sh' 'exit 1' >"$HOME/.local/bin/simplesuite-uninstall"
+chmod 755 "$HOME/.local/bin/simplesuite-uninstall"
+
+programs='simplewords simplenote simplecheck simpletrident simplefiles simplebrowse simpleburn simplechange simplechange-engine simplebrowse-webkitd simplebrowse-jsdump simplefiles-macos-helper simplevis-macos-capture simpleflac simpleradio simplepod simplevis simplevol simplevol-audio simplepdf simplebook simplebook-mobi simpleclock simplecal simplestats simplever simplesave simplesearch simplegame simplenews simplemail simplenet simpleblue simpleserve simpleserved setup-server'
+aliases='blue:simpleblue browse:simplebrowse burn:simpleburn change:simplechange cal:simplecal check:simplecheck clock:simpleclock files:simplefiles flac:simpleflac game:simplegame mail:simplemail net:simplenet news:simplenews note:simplenote book:simplebook pdf:simplepdf pod:simplepod radio:simpleradio save:simplesave search:simplesearch serve:simpleserve stats:simplestats suite-uninstall:simplesuite-uninstall trident:simpletrident ver:simplever vis:simplevis vol:simplevol words:simplewords'
+for program in $programs; do
+    printf '%s\n' '#!/bin/sh' >"$HOME/.local/bin/$program"
+    chmod 755 "$HOME/.local/bin/$program"
+    cp "$HOME/.local/bin/$program" "$SYSTEM_BIN/$program"
+done
+for mapping in $aliases; do
+    short=${mapping%%:*}
+    full=${mapping#*:}
+    [ "$short" != "$full" ] || continue
+    ln -s "$full" "$HOME/.local/bin/$short"
+    ln -s "$full" "$SYSTEM_BIN/$short"
+done
+rm "$SYSTEM_BIN/cal"
+ln -s "$SYSTEM_BIN/simplecal" "$SYSTEM_BIN/cal"
+printf '%s\n' personal >"$HOME/.local/bin/ytmp3"
+printf '%s\n' unrelated >"$SYSTEM_BIN/unrelated-tool"
+# Even a familiar short name must be preserved if it is not our symlink.
+rm "$SYSTEM_BIN/check"
+printf '%s\n' unrelated-check >"$SYSTEM_BIN/check"
+
+mkdir -p \
+    "$HOME/writing" \
+    "$HOME/.writing-clone-tmp" \
+    "$HOME/.config/scriptorium" \
+    "$HOME/.config/simplewords" \
+    "$HOME/.config/simplesuite" \
+    "$HOME/.config/isyncrc-target" \
+    "$HOME/.cache/simplewords" \
+    "$HOME/xdg-cache/simplebook" \
+    "$HOME/xdg-cache/simplechange" \
+    "$HOME/.local/state/simplewords" \
+    "$HOME/.local/share/simplemail/mail/Inbox/cur" \
+    "$HOME/.local/share/simplesuite" \
+    "$HOME/.scriptorium-backups/old"
+
+printf '%s\n' 'typewriter_sound=false' 'typewriter_sound_volume=70' \
+    >"$HOME/.config/simplewords/config"
+printf '%s\n' keep >"$HOME/.local/share/simplemail/mail/Inbox/cur/message"
+printf '%s\n' keep >"$HOME/unrelated-file"
+printf '%s\n' keep >"$HOME/.writing-clone-tmp/partial"
+printf '%s\n' keep >"$HOME/.scriptorium-backups/old/config"
+printf '%s\n' keep >"$HOME/.config/scriptorium/legacy-marker"
+printf '%s\n' keep >"$HOME/xdg-cache/simplebook/document.txt"
+printf '%s\n' converted >"$HOME/xdg-cache/simplebook/document.epub"
+printf '%s\n' keep >"$FAKE_SUITE/simplewords.c"
+mkdir -p "$HOME/writing/notes"
+printf '%s\n' 'journal entry' >"$HOME/writing/notes/2026-10-05-001.txt"
+for shell_rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    printf '%s\n' '# SimpleSuite aliases' "alias note='simplenote'" "alias save='simplesave'" "alias search='simplesearch'" "alias burn='simpleburn'" "alias change='simplechange'" \
+        "alias personal='echo keep'" >"$shell_rc"
+done
+mkdir -p "$HOME/.config/fish/conf.d"
+printf '%s\n' "alias note='simplenote'" "alias save='simplesave'" "alias search='simplesearch'" "alias burn='simpleburn'" "alias change='simplechange'" "alias personal='echo keep'" \
+    >"$HOME/.config/fish/conf.d/scriptorium.fish"
+
+FAKE_FREEBSD_HELPER="$HOME/system-libexec/simplefiles-freebsd-unmount"
+mkdir -p "$(dirname "$FAKE_FREEBSD_HELPER")"
+printf '%s\n' '#!/bin/sh' 'exit 0' >"$FAKE_FREEBSD_HELPER"
+chmod 755 "$FAKE_FREEBSD_HELPER"
+
+FAKE_SIMPLESERVE_DAEMON="$HOME/system-sbin/simpleserved"
+FAKE_SIMPLESERVE_UNINSTALLER="$HOME/system-sbin/simpleserve-system-uninstall"
+mkdir -p "$(dirname "$FAKE_SIMPLESERVE_DAEMON")"
+printf '%s\n' '#!/bin/sh' 'exit 0' >"$FAKE_SIMPLESERVE_DAEMON"
+cat >"$FAKE_SIMPLESERVE_UNINSTALLER" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >"$HOME/system-uninstall-args"
+rm -f "$SIMPLESERVE_SYSTEM_DAEMON" "$SIMPLESERVE_SYSTEM_UNINSTALLER"
+EOF
+chmod 755 "$FAKE_SIMPLESERVE_DAEMON" "$FAKE_SIMPLESERVE_UNINSTALLER"
+
+mkdir -p "$SYSTEM_DATA/source" "$HOME/.config/simplevol" "$HOME/.config/systemd/user"
+printf '%s\n' keep >"$SYSTEM_DATA/source/README.md"
+printf '%s\n' keep >"$SYSTEM_DATA/unrelated-file"
+printf '%s\n' fixture >"$HOME/.config/systemd/user/simplevol.service"
+assets='SIMPLECHANGE.md screenshots/simplechange.png screenshots/simplechange-document.png screenshots/simplechange-ebook.png simplecal-alarm.mp3 simplewords-typewriter.wav simplewords-typewriter-alt.wav simplewords-typewriter-space.wav simplewords-typewriter-enter.wav simplewords-typewriter-delete.wav simplewords-typewriter-NOTICE.md install-source install-manifest simplevol-meter.so SIMPLEVOL.md command-abbreviations program-manifest.sh'
+for asset in $assets; do
+    mkdir -p "$(dirname "$HOME/.local/share/simplesuite/$asset")" "$(dirname "$SYSTEM_DATA/$asset")"
+    printf '%s\n' keep >"$HOME/.local/share/simplesuite/$asset"
+    printf '%s\n' fixture >"$SYSTEM_DATA/$asset"
+done
+
+cat >"$HOME/.mbsyncrc" <<'EOF'
+# unrelated mail setting
+KeepThis yes
+# BEGIN SCRIPTORIUM SIMPLEMAIL GMAIL
+Pass "secret"
+# END SCRIPTORIUM SIMPLEMAIL GMAIL
+EOF
+ln -s "$HOME/.mbsyncrc" "$HOME/.config/isyncrc"
+
+printf '%s\n' BURN | \
+    PATH="$FAKE_BIN:$REAL_BASH_DIR:/usr/local/bin:/usr/bin:/bin" \
+    XDG_CACHE_HOME="$HOME/xdg-cache" \
+    FREEBSD_UNMOUNT_HELPER="$FAKE_FREEBSD_HELPER" \
+    SIMPLESERVE_SYSTEM_DAEMON="$FAKE_SIMPLESERVE_DAEMON" \
+    SIMPLESERVE_SYSTEM_UNINSTALLER="$FAKE_SIMPLESERVE_UNINSTALLER" \
+    SIMPLESERVE_SYSTEM_TEST_MODE=1 \
+    SIMPLESUITE_DIR="$FAKE_SUITE" \
+    SIMPLESUITE_SYSTEM_BIN_DIR="$SYSTEM_BIN" \
+    SIMPLESUITE_SYSTEM_DATA_DIR="$SYSTEM_DATA" \
+    "$FAKE_ROOT/burn.sh" >"$TMP/burn.log"
+
+[[ "$(cat "$HOME/native-burn-args")" == '--burn --yes' ]] ||
+    fail "burn.sh did not invoke SimpleSuite native burn with confirmation"
+
+assert_missing "$FAKE_ROOT"
+assert_missing "$FAKE_SUITE"
+assert_missing "$HOME/writing"
+assert_missing "$HOME/.writing-clone-tmp"
+assert_missing "$HOME/.config/simplewords"
+assert_missing "$HOME/.config/simplevol"
+assert_missing "$HOME/.config/systemd/user/simplevol.service"
+assert_missing "$HOME/.config/scriptorium"
+assert_missing "$HOME/.config/simplesuite"
+assert_missing "$HOME/.config/isyncrc"
+assert_missing "$HOME/.cache/simplewords"
+assert_missing "$HOME/xdg-cache/simplebook"
+assert_missing "$HOME/xdg-cache/simplechange"
+assert_missing "$HOME/.local/state/simplewords"
+assert_missing "$HOME/.local/share/simplemail"
+assert_missing "$HOME/.local/share/simplesuite"
+for asset in $assets; do
+    assert_missing "$SYSTEM_DATA/$asset"
+done
+[[ $(cat "$SYSTEM_DATA/source/README.md") == keep ]]
+[[ $(cat "$SYSTEM_DATA/unrelated-file") == keep ]]
+assert_missing "$HOME/.scriptorium-backups"
+assert_missing "$FAKE_FREEBSD_HELPER"
+assert_missing "$FAKE_SIMPLESERVE_DAEMON"
+assert_missing "$FAKE_SIMPLESERVE_UNINSTALLER"
+[[ "$(cat "$HOME/system-uninstall-args")" == '--purge' ]] ||
+    fail "burn.sh did not purge the SimpleServe system service"
+
+for program in $programs simplesuite-uninstall; do
+    assert_missing "$HOME/.local/bin/$program"
+    assert_missing "$SYSTEM_BIN/$program"
+done
+for mapping in $aliases; do
+    assert_missing "$HOME/.local/bin/${mapping%%:*}"
+    [[ ${mapping%%:*} == check ]] || assert_missing "$SYSTEM_BIN/${mapping%%:*}"
+done
+[[ "$(cat "$HOME/.local/bin/ytmp3")" == personal ]] || fail 'burn removed a personal utility'
+[[ "$(cat "$SYSTEM_BIN/unrelated-tool")" == unrelated ]] || fail 'burn removed an unrelated system command'
+[[ "$(cat "$SYSTEM_BIN/check")" == unrelated-check ]] || fail 'burn removed an unrelated short command'
+
+[[ -f "$HOME/unrelated-file" ]] || fail "burn removed an unrelated file"
+for shell_rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.config/fish/conf.d/scriptorium.fish"; do
+    ! grep -q "alias note='simplenote'" "$shell_rc" || fail 'burn left the note alias'
+    ! grep -q "alias save='simplesave'" "$shell_rc" || fail 'burn left the save alias'
+    ! grep -q "alias search='simplesearch'" "$shell_rc" || fail 'burn left the search alias'
+    ! grep -q "alias burn='simpleburn'" "$shell_rc" || fail 'burn left the simpleburn alias'
+    ! grep -q "alias change='simplechange'" "$shell_rc" || fail 'burn left the simplechange alias'
+    grep -qx "alias personal='echo keep'" "$shell_rc" || fail 'burn removed a personal alias'
+done
+grep -q '^KeepThis yes$' "$HOME/.mbsyncrc" ||
+    fail "burn removed unrelated mbsync configuration"
+if grep -q 'SCRIPTORIUM SIMPLEMAIL\|Pass "secret"' "$HOME/.mbsyncrc"; then
+    fail "burn left Scriptorium mail credentials"
+fi
+
+echo 'OK Scriptorium burn covers the native and fallback SimpleSuite payload'
